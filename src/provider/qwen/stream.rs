@@ -1,16 +1,6 @@
-//! `Qwen` 流式响应解析模块。
+//! `Qwen` 流式解析。
 //!
-//! 该模块负责解析 `DashScope` / `Qwen` 的单条 `SSE` 事件数据，并将其转换为
-//! SDK 公共的 [`StreamChunk`]。
-//!
-//! 设计上采用“有状态增量解析器”：
-//! 1. 普通文本增量可以即时映射为 [`StreamChunk`]；
-//! 2. 工具调用参数在流中可能会被拆成多段，因此解析器内部维护累积状态，只有在
-//!    收到 `finish_reason = "tool_calls"` 时才输出完整工具调用；
-//! 3. 当收到 `finish_reason = "stop"` 时，会产出一个带结束原因的尾片段，而不是依赖
-//!    额外的协议外终止标记。
-//!
-//! 该模块依赖 `serde_json` 解析单条事件数据，并复用 `types` 模块中的流式响应与工具调用类型。
+//! 解析单条 `SSE` 事件并转换为公共 `StreamChunk`。
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,21 +8,6 @@ use serde_json::Value;
 use crate::{FinishReason, LlmError, StreamChunk, ToolCall, Usage};
 
 /// `Qwen` 流式事件解析器。
-///
-/// 该解析器按事件顺序消费 `SSE` 的 `data:` 文本，并在需要时维护工具调用碎片的中间状态。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::provider::qwen::stream::QwenStreamParser;
-///
-/// let mut parser = QwenStreamParser::new();
-/// let chunk = parser
-///     .parse_event(r#"{"output":{"choices":[{"message":{"content":"你"},"finish_reason":null}]}}"#)
-///     .expect("事件应解析成功")
-///     .expect("应产出文本增量");
-///
-/// assert_eq!(chunk.delta(), "你");
-/// ```
 #[derive(Debug, Default)]
 pub struct QwenStreamParser {
     pending_tool_calls: Vec<PartialToolCall>,
@@ -40,97 +15,28 @@ pub struct QwenStreamParser {
 
 impl QwenStreamParser {
     /// 创建流式事件解析器。
-    ///
-    /// # Returns
-    /// 空状态的 `Qwen` 流式解析器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::qwen::stream::QwenStreamParser;
-    ///
-    /// let parser = QwenStreamParser::new();
-    /// assert_eq!(format!("{parser:?}"), "QwenStreamParser { pending_tool_calls: [] }");
-    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// 重置内部累积状态。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::qwen::stream::QwenStreamParser;
-    ///
-    /// let mut parser = QwenStreamParser::new();
-    /// parser.reset();
-    /// ```
     pub fn reset(&mut self) {
         self.pending_tool_calls.clear();
     }
 
     /// 解析单条 `SSE` 事件的 `data:` 文本。
-    ///
-    /// # Arguments
-    /// * `event_data` - 单条 `SSE` 事件的数据部分，不包含 `data:` 前缀
-    ///
-    /// # Returns
-    /// - `Ok(None)`：表示该事件不产生可消费的公共增量
-    /// - `Ok(Some(StreamChunk))`：表示成功产出一条公共流式增量
-    ///
     /// # Errors
     /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
     /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::qwen::stream::QwenStreamParser;
-    ///
-    /// let mut parser = QwenStreamParser::new();
-    /// let chunk = parser
-    ///     .parse_event(r#"{"output":{"choices":[{"message":{"content":"好"},"finish_reason":null}]}}"#)
-    ///     .expect("事件应解析成功")
-    ///     .expect("应产出文本增量");
-    ///
-    /// assert_eq!(chunk.delta(), "好");
-    /// ```
-    /// 若同一事件中包含多个逻辑片段，该方法会返回最后一个片段。通常这意味着正文增量或
-    /// 携带 `finish_reason`、`usage`、`tool_calls` 的尾片段。
     pub fn parse_event(&mut self, event_data: &str) -> Result<Option<StreamChunk>, LlmError> {
         Ok(self.parse_event_chunks(event_data)?.into_iter().last())
     }
 
-    /// 解析单条 `SSE` 事件，并返回其中包含的全部公共流式片段。
-    ///
-    /// 某些模型可能在同一条事件里同时返回思考文本和正式回复文本。此时
-    /// [`QwenStreamParser::parse_event`] 只会返回最后一个片段，而该方法会完整返回
-    /// 当前事件中的全部片段。
-    ///
-    /// # Arguments
-    /// * `event_data` - 单条 `SSE` 事件的数据部分，不包含 `data:` 前缀
-    ///
-    /// # Returns
-    /// 当前事件解析得到的零个或多个流式片段。
-    ///
+    /// 解析单条 `SSE` 事件并返回其中全部片段。
     /// # Errors
     /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
     /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::qwen::stream::QwenStreamParser;
-    ///
-    /// let mut parser = QwenStreamParser::new();
-    /// let chunks = parser
-    ///     .parse_event_chunks(
-    ///         r#"{"output":{"choices":[{"message":{"reasoning_content":"先分析","content":"再回答"},"finish_reason":null}]}}"#,
-    ///     )
-    ///     .expect("事件应解析成功");
-    ///
-    /// assert_eq!(chunks.len(), 2);
-    /// assert!(chunks[0].is_thinking());
-    /// assert_eq!(chunks[1].delta(), "再回答");
-    /// ```
     pub fn parse_event_chunks(
         &mut self,
         event_data: &str,
@@ -258,24 +164,7 @@ impl QwenStreamParser {
     }
 }
 
-/// 判断事件是否为通用的 `[DONE]` 终止标记。
-///
-/// `Qwen` 常见场景下通常依赖 `finish_reason = "stop"` 结束，但这里保留对 `[DONE]`
-/// 的兼容支持，便于在代理层或中间网关复用时保持鲁棒性。
-///
-/// # Arguments
-/// * `event_data` - 单条 `SSE` 事件的数据部分
-///
-/// # Returns
-/// 若事件内容为 `[DONE]`，则返回 `true`。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::provider::qwen::stream::is_done_event;
-///
-/// assert!(is_done_event("[DONE]"));
-/// assert!(!is_done_event("{}"));
-/// ```
+/// 判断事件是否为 `[DONE]` 终止标记。
 #[must_use]
 pub fn is_done_event(event_data: &str) -> bool {
     event_data.trim() == "[DONE]"

@@ -1,16 +1,6 @@
-//! `Qwen` 响应反序列化模块。
+//! `Qwen` 响应反序列化。
 //!
-//! 该模块负责将 `DashScope` / `Qwen` 的非流式响应体解析为 SDK 公共响应模型。
-//!
-//! 设计上采用“先解析私有结构，再映射公共类型”的方式：
-//! 1. 先以 `Qwen` 私有结构体承接响应，避免公共类型直接耦合 `output`、`usage`
-//!    等供应商特有字段层级；
-//! 2. 再把首个 `choice` 转换为 [`ChatResponse`]，统一提取文本内容、工具调用、
-//!    结束原因与用量信息；
-//! 3. 当响应体包含业务错误对象时，优先转换为 [`LlmError::ApiError`]，让上层得到
-//!    稳定的错误语义。
-//!
-//! 该模块依赖 `serde_json` 解析原始响应体，并复用 `types` 模块中的响应与工具调用类型。
+//! 将 Qwen 非流式响应解析为公共响应模型。
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,13 +8,6 @@ use serde_json::Value;
 use crate::{ChatResponse, FinishReason, LlmError, ToolCall, Usage};
 
 /// 将 `Qwen` 非流式响应体解析为公共聊天响应。
-///
-/// # Arguments
-/// * `body` - `Qwen` 返回的原始响应体字节
-///
-/// # Returns
-/// 统一后的聊天响应对象。
-///
 /// # Errors
 /// - [`LlmError::ParseError`]：当响应体不是合法 `JSON` 时触发
 /// - [`LlmError::ApiError`]：当响应体是 `Qwen` 错误对象，或缺少必要字段时触发

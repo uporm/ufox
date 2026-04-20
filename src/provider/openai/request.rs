@@ -1,16 +1,6 @@
-//! `OpenAI` 请求序列化模块。
+//! `OpenAI` 请求序列化。
 //!
-//! 该模块负责将 SDK 的公共消息模型、工具定义模型转换为 `OpenAI Chat Completions`
-//! 所需的私有请求格式。
-//!
-//! 设计上采用“公共类型先归一化，再落为私有 JSON”的方式：
-//! 1. 先把消息、多模态片段和工具定义转换为 `OpenAI` 私有结构体；
-//! 2. 最终再统一序列化为 `serde_json::Value`，便于上层适配器直接作为请求体发送；
-//! 3. 本地图片文件在此阶段被读取并编码为 `data URL`，这样 `client` 层无需感知
-//!    多模态细节，只负责发送标准 `JSON` 请求。
-//!
-//! 该模块依赖 `base64` 编码本地图片、依赖标准库 `fs` 读取图片文件，并依赖
-//! `types` 模块中的消息与工具定义作为输入。
+//! 将公共消息和工具定义转换为 OpenAI 请求体。
 
 use std::fs;
 
@@ -26,18 +16,6 @@ use crate::{
 };
 
 /// 将公共聊天参数转换为 `OpenAI` 私有请求体。
-///
-/// 该函数是 `OpenAI` 适配器构建请求体时的统一入口。
-///
-/// # Arguments
-/// * `model` - 目标模型名称
-/// * `messages` - 发送给模型的消息序列
-/// * `tools` - 可选的工具定义列表
-/// * `stream` - 是否启用流式输出
-///
-/// # Returns
-/// 符合 `OpenAI` `Chat Completions` 协议的请求体 `JSON`。
-///
 /// # Errors
 /// - [`LlmError::UnsupportedFeature`]：当当前公共消息暂时无法映射为 `OpenAI` 请求时触发
 /// - [`LlmError::StreamError`]：当读取本地图片文件失败或构建 `data URL` 失败时触发

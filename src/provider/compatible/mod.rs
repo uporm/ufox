@@ -1,17 +1,6 @@
-//! 兼容 `OpenAI` 协议的供应商模块。
+//! Compatible 适配器。
 //!
-//! 该模块负责聚合与 `OpenAI Chat Completions` 协议兼容的第三方服务接入能力，
-//! 并对外提供统一的 [`CompatibleAdapter`] 入口。
-//!
-//! 设计上采用“协议实现完全复用、接入配置独立声明”的方式：
-//! 1. 请求序列化直接复用 `openai::request`；
-//! 2. 非流式响应解析直接复用 `openai::response`；
-//! 3. 流式事件解析通过本目录下的 `stream` 模块复用 `OpenAI` 解析器；
-//! 4. 适配器层只负责声明自己属于 [`Provider::Compatible`]，并保持 `base_url`
-//!    由上层调用方显式提供。
-//!
-//! 这种设计可以让 `DeepSeek`、`Ollama`、自建网关等兼容接口直接共享协议实现，
-//! 同时不把它们误标识为官方 `OpenAI` Provider。
+//! 复用 OpenAI-compatible 协议实现并暴露兼容适配器入口。
 
 use std::sync::Mutex;
 
@@ -27,18 +16,6 @@ pub mod stream;
 pub use stream::{CompatibleStreamParser, is_done_event};
 
 /// 兼容 `OpenAI` 协议的适配器。
-///
-/// 该适配器面向所有请求体与响应体遵循 `OpenAI Chat Completions` 语义，但基础地址
-/// 由调用方自行指定的服务。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::{Provider, ProviderAdapter};
-/// use ufox_llm::provider::compatible::CompatibleAdapter;
-///
-/// let adapter = CompatibleAdapter::new();
-/// assert_eq!(adapter.provider(), Provider::Compatible);
-/// ```
 #[derive(Debug, Default)]
 pub struct CompatibleAdapter {
     stream_parser: Mutex<CompatibleStreamParser>,
@@ -46,18 +23,6 @@ pub struct CompatibleAdapter {
 
 impl CompatibleAdapter {
     /// 创建兼容 `OpenAI` 协议的适配器。
-    ///
-    /// # Returns
-    /// 可用于构建请求体和解析响应的兼容协议适配器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::compatible::CompatibleAdapter;
-    /// use ufox_llm::{Provider, ProviderAdapter};
-    ///
-    /// let adapter = CompatibleAdapter::new();
-    /// assert_eq!(adapter.provider(), Provider::Compatible);
-    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()

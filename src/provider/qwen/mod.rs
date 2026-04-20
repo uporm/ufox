@@ -1,16 +1,6 @@
-//! `Qwen` 协议适配模块。
+//! Qwen 适配器。
 //!
-//! 该模块负责聚合 `DashScope` / `Qwen` 协议的请求序列化、非流式响应解析、
-//! 流式事件解析，并对外提供统一的 [`QwenAdapter`] 入口。
-//!
-//! 设计上采用“子模块拆分 + 适配器聚合”的方式：
-//! 1. `request` 专注把公共类型序列化为 `Qwen` 私有请求体；
-//! 2. `response` 专注把完整响应体解析为公共 [`ChatResponse`]；
-//! 3. `stream` 专注把单条 `SSE` 事件解析为公共 [`StreamChunk`]，并在内部处理
-//!    工具调用碎片的跨事件聚合；
-//! 4. `QwenAdapter` 则负责将这些能力组合为 [`ProviderAdapter`] 的统一实现。
-//!
-//! 该模块依赖上级 `provider` 抽象，并复用 `types` 模块中的消息、工具与响应类型。
+//! 组合 Qwen 协议下的请求构建、响应解析与流式解析能力。
 
 use std::sync::Mutex;
 
@@ -28,19 +18,6 @@ pub mod stream;
 pub use stream::{QwenStreamParser, is_done_event};
 
 /// `Qwen` 协议适配器。
-///
-/// 该适配器将 `Qwen` 私有协议封装为统一的 [`ProviderAdapter`] 接口。
-/// 对于流式请求，它内部持有一个带锁的 [`QwenStreamParser`]，用于在 trait 的
-/// `&self` 方法签名下继续安全地维护跨事件解析状态。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::{Provider, ProviderAdapter};
-/// use ufox_llm::provider::qwen::QwenAdapter;
-///
-/// let adapter = QwenAdapter::new();
-/// assert_eq!(adapter.provider(), Provider::Qwen);
-/// ```
 #[derive(Debug, Default)]
 pub struct QwenAdapter {
     stream_parser: Mutex<QwenStreamParser>,
@@ -48,18 +25,6 @@ pub struct QwenAdapter {
 
 impl QwenAdapter {
     /// 创建 `Qwen` 协议适配器。
-    ///
-    /// # Returns
-    /// 可用于构建请求体和解析响应的 `Qwen` 适配器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::qwen::QwenAdapter;
-    /// use ufox_llm::{Provider, ProviderAdapter};
-    ///
-    /// let adapter = QwenAdapter::new();
-    /// assert_eq!(adapter.provider(), Provider::Qwen);
-    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()

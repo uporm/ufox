@@ -1,17 +1,6 @@
 //! 客户端模块。
 //!
-//! 该模块负责提供 SDK 对外的主客户端类型 [`Client`]，以及围绕它的核心调用能力：
-//! 1. 统一读取由 [`builder`](crate::client::builder) 构建出的静态配置；
-//! 2. 根据 [`Provider`](crate::Provider) 选择对应的协议适配器；
-//! 3. 发送非流式与流式聊天请求，并将底层 `HTTP` / `SSE` 细节收敛为公共类型。
-//!
-//! 设计上将“配置构建”和“请求执行”分离：
-//! 1. `builder` 负责 typestate 编译期校验与 Provider 独立配置建模；
-//! 2. 本模块负责运行时请求发送、错误映射和流式桥接；
-//! 3. `provider` 层只专注协议转换，不直接参与网络发送。
-//!
-//! 该模块依赖 `reqwest` 发送请求，依赖 `eventsource-stream` 解析 `SSE`，
-//! 并依赖 `futures-util` 提供异步流适配能力。
+//! 提供 `Client`、请求构建器和请求发送主流程。
 
 use std::{
     collections::HashMap,
@@ -41,22 +30,6 @@ pub use builder::{
 /// 聊天流式响应类型。
 ///
 /// 该类型是对异步流返回值的统一封装。流中的每一项都是一次增量输出或终止片段。
-///
-/// # 示例
-/// ```rust
-/// use futures_util::StreamExt;
-/// use ufox_llm::{ChatStream, Client, Provider};
-///
-/// let client = Client::builder()
-///     .provider(Provider::OpenAI)
-///     .api_key("sk-demo")
-///     .model("gpt-4o")
-///     .build()
-///     .expect("应构建成功");
-///
-/// let _stream: ChatStream = futures_util::stream::empty().boxed();
-/// let _ = client;
-/// ```
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
 /// 单次聊天请求的附加选项。
@@ -74,7 +47,6 @@ pub struct RequestOptions {
 }
 
 impl RequestOptions {
-    /// 返回空请求选项。
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -86,66 +58,56 @@ impl RequestOptions {
         }
     }
 
-    /// 设置是否开启思考模式。
     #[must_use]
     pub const fn with_thinking(mut self, thinking: bool) -> Self {
         self.thinking = thinking;
         self
     }
 
-    /// 设置思考预算。
     #[must_use]
     pub const fn with_thinking_budget(mut self, thinking_budget: u32) -> Self {
         self.thinking_budget = Some(thinking_budget);
         self
     }
 
-    /// 设置推理强度。
     #[must_use]
     pub const fn with_reasoning_effort(mut self, reasoning_effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(reasoning_effort);
         self
     }
 
-    /// 设置工具调用策略。
     #[must_use]
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = Some(tool_choice);
         self
     }
 
-    /// 设置是否允许并行工具调用。
     #[must_use]
     pub const fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
         self.parallel_tool_calls = Some(parallel_tool_calls);
         self
     }
 
-    /// 返回是否显式开启思考模式。
     #[must_use]
     pub const fn thinking(&self) -> bool {
         self.thinking
     }
 
-    /// 返回思考预算上限。
     #[must_use]
     pub const fn thinking_budget(&self) -> Option<u32> {
         self.thinking_budget
     }
 
-    /// 返回推理强度配置。
     #[must_use]
     pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.reasoning_effort
     }
 
-    /// 返回工具调用策略。
     #[must_use]
     pub fn tool_choice(&self) -> Option<&ToolChoice> {
         self.tool_choice.as_ref()
     }
 
-    /// 返回是否允许并行工具调用。
     #[must_use]
     pub const fn parallel_tool_calls(&self) -> Option<bool> {
         self.parallel_tool_calls
@@ -180,130 +142,30 @@ impl<'a> ChatRequestBuilder<'a> {
         }
     }
 
-    /// 设置是否开启思考模式。
-    ///
-    /// # Arguments
-    /// * `enabled` - 是否开启思考模式
-    ///
-    /// # Returns
-    /// 附带思考配置后的请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::Qwen)
-    /// #     .api_key("sk-demo")
-    /// #     .model("qwen3-max")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请分析这道题")];
-    /// let _request = client.chat(&messages).thinking(true);
-    /// ```
     #[must_use]
     pub fn thinking(mut self, enabled: bool) -> Self {
         self.options.thinking = enabled;
         self
     }
 
-    /// 设置思考阶段的 `token` 预算上限。
-    ///
-    /// # Arguments
-    /// * `budget` - 思考阶段预算上限
-    ///
-    /// # Returns
-    /// 附带预算配置后的请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::Qwen)
-    /// #     .api_key("sk-demo")
-    /// #     .model("qwen3-max")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请详细推理")];
-    /// let _request = client.chat(&messages).thinking_budget(8_000);
-    /// ```
     #[must_use]
     pub fn thinking_budget(mut self, budget: u32) -> Self {
         self.options.thinking_budget = Some(budget);
         self
     }
 
-    /// 设置推理强度。
-    ///
-    /// # Arguments
-    /// * `effort` - 推理强度
-    ///
-    /// # Returns
-    /// 附带推理强度后的请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message, ReasoningEffort};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::OpenAI)
-    /// #     .api_key("sk-demo")
-    /// #     .model("o3-mini")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请推导这个结论")];
-    /// let _request = client
-    ///     .chat(&messages)
-    ///     .reasoning_effort(ReasoningEffort::High);
-    /// ```
     #[must_use]
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.options.reasoning_effort = Some(effort);
         self
     }
 
-    /// 设置工具调用策略。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, JsonType, Message, Tool, ToolChoice};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::OpenAI)
-    /// #     .api_key("sk-demo")
-    /// #     .model("gpt-4o")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let tool = Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build();
-    /// let messages = vec![Message::user("杭州天气")];
-    /// let _request = client
-    ///     .chat_with_tools(&messages, &[tool])
-    ///     .tool_choice(ToolChoice::function("get_weather"));
-    /// ```
     #[must_use]
     pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.options.tool_choice = Some(tool_choice);
         self
     }
 
-    /// 设置是否允许并行工具调用。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, JsonType, Message, Tool};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::OpenAI)
-    /// #     .api_key("sk-demo")
-    /// #     .model("gpt-4o")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let tool = Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build();
-    /// let messages = vec![Message::user("北京和上海天气")];
-    /// let _request = client
-    ///     .chat_with_tools(&messages, &[tool])
-    ///     .parallel_tool_calls(true);
-    /// ```
     #[must_use]
     pub fn parallel_tool_calls(mut self, enabled: bool) -> Self {
         self.options.parallel_tool_calls = Some(enabled);
@@ -345,130 +207,30 @@ impl<'a> ChatStreamRequestBuilder<'a> {
         }
     }
 
-    /// 设置是否开启思考模式。
-    ///
-    /// # Arguments
-    /// * `enabled` - 是否开启思考模式
-    ///
-    /// # Returns
-    /// 附带思考配置后的流式请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::Qwen)
-    /// #     .api_key("sk-demo")
-    /// #     .model("qwen3-max")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请先思考再回答")];
-    /// let _request = client.chat_stream(&messages).thinking(true);
-    /// ```
     #[must_use]
     pub fn thinking(mut self, enabled: bool) -> Self {
         self.options.thinking = enabled;
         self
     }
 
-    /// 设置思考阶段的 `token` 预算上限。
-    ///
-    /// # Arguments
-    /// * `budget` - 思考阶段预算上限
-    ///
-    /// # Returns
-    /// 附带预算配置后的流式请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::Qwen)
-    /// #     .api_key("sk-demo")
-    /// #     .model("qwen3-max")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请详细分析")];
-    /// let _request = client.chat_stream(&messages).thinking_budget(8_000);
-    /// ```
     #[must_use]
     pub fn thinking_budget(mut self, budget: u32) -> Self {
         self.options.thinking_budget = Some(budget);
         self
     }
 
-    /// 设置推理强度。
-    ///
-    /// # Arguments
-    /// * `effort` - 推理强度
-    ///
-    /// # Returns
-    /// 附带推理强度后的流式请求构建器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, Message, ReasoningEffort};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::OpenAI)
-    /// #     .api_key("sk-demo")
-    /// #     .model("o3-mini")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let messages = vec![Message::user("请逐步推理")];
-    /// let _request = client
-    ///     .chat_stream(&messages)
-    ///     .reasoning_effort(ReasoningEffort::High);
-    /// ```
     #[must_use]
     pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.options.reasoning_effort = Some(effort);
         self
     }
 
-    /// 设置工具调用策略。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, JsonType, Message, Tool, ToolChoice};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::OpenAI)
-    /// #     .api_key("sk-demo")
-    /// #     .model("gpt-4o")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let tool = Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build();
-    /// let messages = vec![Message::user("杭州天气")];
-    /// let _request = client
-    ///     .chat_with_tools(&messages, &[tool])
-    ///     .tool_choice(ToolChoice::Required);
-    /// ```
     #[must_use]
     pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.options.tool_choice = Some(tool_choice);
         self
     }
 
-    /// 设置是否允许并行工具调用。
-    ///
-    /// # 示例
-    /// ```rust
-    /// # use ufox_llm::{Client, JsonType, Message, Tool};
-    /// # let client = Client::builder()
-    /// #     .provider(ufox_llm::Provider::Qwen)
-    /// #     .api_key("sk-demo")
-    /// #     .model("qwen-max")
-    /// #     .build()
-    /// #     .expect("应构建成功");
-    /// let tool = Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build();
-    /// let messages = vec![Message::user("北京和上海天气")];
-    /// let _request = client
-    ///     .chat_with_tools(&messages, &[tool])
-    ///     .parallel_tool_calls(true);
-    /// ```
     #[must_use]
     pub fn parallel_tool_calls(mut self, enabled: bool) -> Self {
         self.options.parallel_tool_calls = Some(enabled);
@@ -492,21 +254,6 @@ impl<'a> IntoFuture for ChatStreamRequestBuilder<'a> {
 /// `LLM` 客户端。
 ///
 /// 该类型是 SDK 对外的主入口，负责根据构建配置发送聊天请求并解析响应。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::{Client, Provider};
-///
-/// let client = Client::builder()
-///     .provider(Provider::Compatible)
-///     .base_url("https://api.deepseek.com/v1")
-///     .api_key("sk-demo")
-///     .model("deepseek-chat")
-///     .build()
-///     .expect("应构建成功");
-///
-/// assert_eq!(client.config().provider(), Provider::Compatible);
-/// ```
 #[derive(Clone)]
 pub struct Client {
     config: ClientConfig,
@@ -524,17 +271,6 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// 创建客户端构建器。
-    ///
-    /// # Returns
-    /// 处于初始 typestate 状态的 [`ClientBuilder`]。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::Client;
-    ///
-    /// let _builder = Client::builder();
-    /// ```
     #[must_use]
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -550,92 +286,27 @@ impl Client {
         }
     }
 
-    /// 返回客户端静态配置。
-    ///
-    /// # Returns
-    /// 当前客户端实例持有的静态配置对象。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::{Client, Provider};
-    ///
-    /// let client = Client::builder()
-    ///     .provider(Provider::OpenAI)
-    ///     .api_key("sk-demo")
-    ///     .build()
-    ///     .expect("应构建成功");
-    ///
-    /// assert_eq!(client.config().provider(), Provider::OpenAI);
-    /// ```
     #[must_use]
     pub const fn config(&self) -> &ClientConfig {
         &self.config
     }
 
     /// 发送非流式聊天请求。
-    ///
-    /// # Arguments
-    /// * `messages` - 对话消息序列
-    ///
-    /// # Returns
-    /// Provider 返回的完整聊天响应。
-    ///
     /// # Errors
     /// - [`LlmError::ApiError`]：当 Provider 返回业务失败或本地关键配置缺失时触发
     /// - [`LlmError::AuthError`]：当接口返回 `401` 时触发
     /// - [`LlmError::RateLimitError`]：当接口返回 `429` 时触发
     /// - [`LlmError::NetworkError`]：当网络请求失败时触发
     /// - [`LlmError::ParseError`]：当响应体解析失败时触发
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::{Client, Message, Provider};
-    ///
-    /// let client = Client::builder()
-    ///     .provider(Provider::OpenAI)
-    ///     .api_key("sk-demo")
-    ///     .model("gpt-4o")
-    ///     .build()
-    ///     .expect("应构建成功");
-    /// let messages = vec![Message::user("你好")];
-    ///
-    /// let _ = (client, messages);
-    /// ```
     #[must_use]
     pub fn chat<'a>(&'a self, messages: &'a [Message]) -> ChatRequestBuilder<'a> {
         ChatRequestBuilder::new(self, messages, None)
     }
 
     /// 发送带工具定义的非流式聊天请求。
-    ///
-    /// # Arguments
-    /// * `messages` - 对话消息序列
-    /// * `tools` - 提供给模型的工具定义列表
-    ///
-    /// # Returns
-    /// Provider 返回的完整聊天响应。
-    ///
     /// # Errors
     /// - [`LlmError::UnsupportedFeature`]：当当前 Provider 不支持工具调用时触发
     /// - 其余错误与 [`Client::chat`] 相同
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::{Client, JsonType, Message, Provider, Tool};
-    ///
-    /// let client = Client::builder()
-    ///     .provider(Provider::OpenAI)
-    ///     .api_key("sk-demo")
-    ///     .model("gpt-4o")
-    ///     .build()
-    ///     .expect("应构建成功");
-    /// let messages = vec![Message::user("杭州天气")];
-    /// let tools = [Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build()];
-    ///
-    /// let _ = (client, messages, tools);
-    /// ```
     #[must_use]
     pub fn chat_with_tools<'a>(
         &'a self,
@@ -646,68 +317,20 @@ impl Client {
     }
 
     /// 发送流式聊天请求。
-    ///
-    /// # Arguments
-    /// * `messages` - 对话消息序列
-    ///
-    /// # Returns
-    /// 可异步迭代的流式响应。
-    ///
     /// # Errors
     /// - [`LlmError::ApiError`]：当 Provider 返回业务失败或本地关键配置缺失时触发
     /// - [`LlmError::AuthError`]：当接口返回 `401` 时触发
     /// - [`LlmError::RateLimitError`]：当接口返回 `429` 时触发
     /// - [`LlmError::NetworkError`]：当网络请求失败时触发
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::{Client, Message, Provider};
-    ///
-    /// let client = Client::builder()
-    ///     .provider(Provider::OpenAI)
-    ///     .api_key("sk-demo")
-    ///     .model("gpt-4o")
-    ///     .build()
-    ///     .expect("应构建成功");
-    /// let messages = vec![Message::user("你好")];
-    ///
-    /// let _ = (client, messages);
-    /// ```
     #[must_use]
     pub fn chat_stream<'a>(&'a self, messages: &'a [Message]) -> ChatStreamRequestBuilder<'a> {
         ChatStreamRequestBuilder::new(self, messages, None)
     }
 
     /// 发送带工具定义的流式聊天请求。
-    ///
-    /// # Arguments
-    /// * `messages` - 对话消息序列
-    /// * `tools` - 提供给模型的工具定义列表
-    ///
-    /// # Returns
-    /// 可异步迭代的流式响应。
-    ///
     /// # Errors
     /// - [`LlmError::UnsupportedFeature`]：当当前 Provider 不支持工具调用时触发
     /// - 其余错误与 [`Client::chat_stream`] 相同
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::{Client, JsonType, Message, Provider, Tool};
-    ///
-    /// let client = Client::builder()
-    ///     .provider(Provider::OpenAI)
-    ///     .api_key("sk-demo")
-    ///     .model("gpt-4o")
-    ///     .build()
-    ///     .expect("应构建成功");
-    /// let messages = vec![Message::user("北京和上海天气")];
-    /// let tools = [Tool::function("get_weather")
-    ///     .param("city", JsonType::String, "城市名称", true)
-    ///     .build()];
-    ///
-    /// let _ = (client, messages, tools);
-    /// ```
     #[must_use]
     pub fn chat_stream_with_tools<'a>(
         &'a self,

@@ -1,16 +1,6 @@
-//! `OpenAI` 协议适配模块。
+//! OpenAI 适配器。
 //!
-//! 该模块负责聚合 `OpenAI Chat Completions` 协议的请求序列化、非流式响应解析、
-//! 流式事件解析，并对外提供统一的 [`OpenAiAdapter`] 入口。
-//!
-//! 设计上采用“子模块拆分 + 适配器聚合”的方式：
-//! 1. `request` 专注把公共类型序列化为 `OpenAI` 私有请求体；
-//! 2. `response` 专注把完整响应体解析为公共 [`ChatResponse`]；
-//! 3. `stream` 专注把单条 `SSE` 事件解析为公共 [`StreamChunk`]，并在内部处理
-//!    工具调用碎片的跨事件聚合；
-//! 4. `OpenAiAdapter` 则负责将这些能力组合为 [`ProviderAdapter`] 的统一实现。
-//!
-//! 该模块依赖上级 `provider` 抽象，并复用 `types` 模块中的消息、工具与响应类型。
+//! 组合 OpenAI 协议下的请求构建、响应解析与流式解析能力。
 
 use std::sync::Mutex;
 
@@ -28,19 +18,6 @@ pub mod stream;
 pub use stream::{OpenAiStreamParser, is_done_event};
 
 /// `OpenAI` 协议适配器。
-///
-/// 该适配器将 `OpenAI` 私有协议封装为统一的 [`ProviderAdapter`] 接口。
-/// 对于流式请求，它内部持有一个带锁的 [`OpenAiStreamParser`]，用于在 trait 的
-/// `&self` 方法签名下继续安全地维护跨事件解析状态。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::{Provider, ProviderAdapter};
-/// use ufox_llm::provider::openai::OpenAiAdapter;
-///
-/// let adapter = OpenAiAdapter::new();
-/// assert_eq!(adapter.provider(), Provider::OpenAI);
-/// ```
 #[derive(Debug, Default)]
 pub struct OpenAiAdapter {
     stream_parser: Mutex<OpenAiStreamParser>,
@@ -48,18 +25,6 @@ pub struct OpenAiAdapter {
 
 impl OpenAiAdapter {
     /// 创建 `OpenAI` 协议适配器。
-    ///
-    /// # Returns
-    /// 可用于构建请求体和解析响应的 `OpenAI` 适配器。
-    ///
-    /// # 示例
-    /// ```rust
-    /// use ufox_llm::provider::openai::OpenAiAdapter;
-    /// use ufox_llm::{Provider, ProviderAdapter};
-    ///
-    /// let adapter = OpenAiAdapter::new();
-    /// assert_eq!(adapter.provider(), Provider::OpenAI);
-    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()

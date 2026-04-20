@@ -1,15 +1,6 @@
-//! 错误类型模块。
+//! 错误类型。
 //!
-//! 该模块负责定义 SDK 对外统一暴露的错误枚举 [`LlmError`]，将不同 Provider、
-//! HTTP 客户端、序列化与流式处理阶段产生的问题收敛为稳定的公共接口。
-//!
-//! 设计上优先保证：
-//! 1. 调用方可以基于错误变体做精确分支处理；
-//! 2. 错误消息保持中文，便于在国内团队项目中直接记录与排障；
-//! 3. 保留底层错误源，方便调试与日志采集。
-//!
-//! 该模块依赖 `thiserror` 生成错误实现，并引用 `reqwest`、`serde_json` 与
-//! 标准库中的 [`std::time::Duration`] 表达底层错误和重试等待时间。
+//! 统一定义 SDK 对外错误枚举。
 
 use std::time::Duration;
 
@@ -19,18 +10,6 @@ use thiserror::Error;
 ///
 /// 该枚举覆盖了调用 LLM Provider 时常见的错误来源，包括鉴权失败、限流、
 /// 网络异常、响应解析失败以及 Provider 不支持某项能力等场景。
-///
-/// # 示例
-/// ```rust
-/// use ufox_llm::LlmError;
-///
-/// let error = LlmError::UnsupportedFeature {
-///     provider: "Qwen".to_string(),
-///     feature: "工具调用".to_string(),
-/// };
-///
-/// assert!(error.to_string().contains("Qwen"));
-/// ```
 #[derive(Debug, Error)]
 pub enum LlmError {
     /// Provider 返回了非预期的业务错误。
