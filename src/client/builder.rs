@@ -6,18 +6,37 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::Provider;
 
-use super::{Client, config::ProviderConfig};
+use super::Client;
+
+/// `Client` 持有的内部运行时设置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClientSettings {
+    /// 当前配置所属的 provider。
+    pub provider: Provider,
+    /// 用于访问 provider API 的凭证。
+    pub api_key: String,
+    /// 自定义 API 基础地址。
+    pub base_url: Option<String>,
+    /// 可选的组织标识。
+    pub organization: Option<String>,
+    /// 未显式指定模型时使用的默认模型名。
+    pub default_model: Option<String>,
+    /// 请求超时时间，单位为秒。
+    pub timeout_secs: Option<u64>,
+    /// 附加到请求中的自定义请求头。
+    pub extra_headers: HashMap<String, String>,
+}
 
 /// 客户端构建器。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientBuilder {
-    provider_config: ProviderConfig,
+    client_settings: ClientSettings,
 }
 
 impl ClientBuilder {
     pub fn new() -> Self {
         Self {
-            provider_config: ProviderConfig {
+            client_settings: ClientSettings {
                 provider: Provider::OpenAI,
                 api_key: "".to_string(),
                 base_url: None,
@@ -30,52 +49,52 @@ impl ClientBuilder {
     }
 
     pub fn provider(mut self, provider: Provider) -> Self {
-        self.provider_config.provider = provider;
+        self.client_settings.provider = provider;
         self
     }
 
     pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.provider_config.api_key = api_key.into();
+        self.client_settings.api_key = api_key.into();
         self
     }
 
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.provider_config.base_url = Some(base_url.into());
+        self.client_settings.base_url = Some(base_url.into());
         self
     }
 
     pub fn organization(mut self, organization: impl Into<String>) -> Self {
-        self.provider_config.organization = Some(organization.into());
+        self.client_settings.organization = Some(organization.into());
         self
     }
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
-        self.provider_config.default_model = Some(model.into());
+        self.client_settings.default_model = Some(model.into());
         self
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.provider_config.timeout_secs = Some(duration_to_timeout_secs(timeout));
+        self.client_settings.timeout_secs = Some(duration_to_timeout_secs(timeout));
         self
     }
 
     /// 添加一个额外请求头。
     pub fn extra_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.provider_config
+        self.client_settings
             .extra_headers
             .insert(key.into(), value.into());
         self
     }
 
     pub fn build(self) -> Result<Client, crate::LlmError> {
-        let provider_config = self.provider_config;
-        if provider_config.api_key.is_empty() {
+        let client_settings = self.client_settings;
+        if client_settings.api_key.is_empty() {
             return Err(crate::LlmError::ValidationError(
                 "尚未设置 api_key，请在构建器中调用 .api_key(...)".to_string(),
             ));
         }
 
-        Ok(Client::from_builder(provider_config))
+        Ok(Client::from_builder(client_settings))
     }
 }
 
@@ -105,9 +124,9 @@ mod tests {
             .expect("应构建成功");
 
         assert_eq!(client.provider(), Provider::OpenAI);
-        assert_eq!(client.provider_config.api_key, "sk-demo");
+        assert_eq!(client.client_settings.api_key, "sk-demo");
         assert_eq!(
-            client.provider_config.default_model.as_deref(),
+            client.client_settings.default_model.as_deref(),
             Some("gpt-4o")
         );
     }
@@ -137,20 +156,20 @@ mod tests {
         let client = ClientBuilder::new()
             .provider(Provider::Qwen)
             .api_key("sk-qwen")
-            .model("qwen-max")
+            .model("qwen3-max")
             .extra_header("X-Trace-Id", "demo-request")
             .build()
             .expect("应构建成功");
 
         assert_eq!(client.provider(), Provider::Qwen);
-        assert_eq!(client.provider_config.api_key, "sk-qwen");
+        assert_eq!(client.client_settings.api_key, "sk-qwen");
         assert_eq!(
-            client.provider_config.default_model.as_deref(),
-            Some("qwen-max")
+            client.client_settings.default_model.as_deref(),
+            Some("qwen3-max")
         );
         assert_eq!(
             client
-                .provider_config
+                .client_settings
                 .extra_headers
                 .get("X-Trace-Id")
                 .map(String::as_str),
@@ -167,6 +186,6 @@ mod tests {
             .build()
             .expect("应构建成功");
 
-        assert_eq!(client.provider_config.timeout_secs, Some(1));
+        assert_eq!(client.client_settings.timeout_secs, Some(1));
     }
 }

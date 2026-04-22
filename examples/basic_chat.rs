@@ -3,7 +3,7 @@
 //! 该示例演示如何：
 //! 1. 从环境变量读取 Provider、API Key、模型与可选基础地址；
 //! 2. 构建一个 [`ufox_llm::Client`]；
-//! 3. 发送一次最基础的非流式聊天请求并打印回复内容。
+//! 3. 使用默认请求选项快捷入口 `chat_messages()` 发送一次非流式聊天请求并打印回复内容。
 //!
 //! 运行前请至少设置：
 //! - `UFOX_LLM_PROVIDER`：`openai` / `qwen` / `compatible`
@@ -17,7 +17,7 @@ use std::env;
 
 use anyhow::{Context, Result, bail};
 use tracing_subscriber::EnvFilter;
-use ufox_llm::{ChatRequest, Client, Message, Provider};
+use ufox_llm::{Client, Message, Provider};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,8 +42,10 @@ async fn main() -> Result<()> {
         Message::user("请用一句话介绍 Rust 适合做什么。"),
     ];
 
-    let request = ChatRequest::new(&messages).build();
-    let response = client.chat(&request).await.context("调用聊天接口失败")?;
+    let response = client
+        .chat_messages(&messages)
+        .await
+        .context("调用聊天接口失败")?;
 
     println!("模型回复：\n{}", response.content);
 
@@ -95,7 +97,7 @@ fn optional_env(key: &str) -> Option<String> {
 fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAI => "gpt-4o",
-        Provider::Qwen => "qwen-max",
+        Provider::Qwen => "qwen3-max",
         // 兼容接口无法可靠推断模型，这里给出一个常见默认值，方便以 DeepSeek 为例快速运行。
         Provider::Compatible => "deepseek-chat",
     }

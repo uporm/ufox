@@ -2,10 +2,18 @@
 //!
 //! 定义 `Provider` 与 `ProviderAdapter`，统一协议构建和响应解析接口。
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ChatResponse, LlmError, Message, StreamChunk, Tool, client::RequestOptions};
+use crate::{ChatResponse, LlmError, Message, RequestOptions, StreamChunk, Tool};
+
+use self::{
+    compatible::CompatibleAdapter,
+    openai::OpenAiAdapter,
+    qwen::QwenAdapter,
+};
 
 pub(crate) mod compatible;
 pub(crate) mod openai;
@@ -17,7 +25,7 @@ pub(crate) mod qwen;
 pub enum Provider {
     /// `OpenAI` 官方协议。
     OpenAI,
-    /// 阿里云 `Qwen` / `DashScope` 协议。
+    /// 阿里云 `Qwen` OpenAI-compatible 协议。
     Qwen,
     /// 与 `OpenAI` `Chat Completions` 协议兼容的第三方服务。
     Compatible,
@@ -43,13 +51,21 @@ impl Provider {
     pub const fn default_base_url(self) -> Option<&'static str> {
         match self {
             Self::OpenAI => Some("https://api.openai.com/v1"),
-            Self::Qwen => Some("https://dashscope-intl.aliyuncs.com/api/v1"),
+            Self::Qwen => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
             Self::Compatible => None,
         }
     }
 
     pub const fn requires_explicit_base_url(self) -> bool {
         self.default_base_url().is_none()
+    }
+
+    pub(crate) fn make_adapter(self) -> Arc<dyn ProviderAdapter> {
+        match self {
+            Self::OpenAI => Arc::new(OpenAiAdapter::new()),
+            Self::Qwen => Arc::new(QwenAdapter::new()),
+            Self::Compatible => Arc::new(CompatibleAdapter::new()),
+        }
     }
 }
 
@@ -63,6 +79,10 @@ pub trait ProviderAdapter: Send + Sync {
 
     fn default_base_url(&self) -> Option<&'static str> {
         self.provider().default_base_url()
+    }
+
+    fn thinking_capability(&self, _model: &str) -> ThinkingCapability {
+        ThinkingCapability::default()
     }
 
     fn chat_path(&self) -> &'static str;
@@ -109,6 +129,16 @@ pub trait ProviderAdapter: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThinkingCapability {
+    /// 是否支持启用 thinking 模式。
+    pub(crate) supports_thinking: bool,
+    /// 是否支持设置 thinking budget。
+    pub(crate) supports_thinking_budget: bool,
+    /// 是否支持设置 reasoning effort。
+    pub(crate) supports_reasoning_effort: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::Provider;
@@ -122,7 +152,7 @@ mod tests {
         );
         assert_eq!(
             Provider::Qwen.default_base_url(),
-            Some("https://dashscope-intl.aliyuncs.com/api/v1")
+            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
         );
         assert!(Provider::Compatible.requires_explicit_base_url());
     }

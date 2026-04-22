@@ -1,6 +1,6 @@
 //! Qwen 适配器。
 //!
-//! 组合 Qwen 协议下的请求构建、响应解析与流式解析能力。
+//! 组合 Qwen OpenAI-compatible 协议下的请求构建、响应解析与流式解析能力。
 
 use std::sync::Mutex;
 
@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::{
     ChatResponse, LlmError, Message, Provider, ProviderAdapter, StreamChunk, Tool,
-    client::RequestOptions,
+    provider::ThinkingCapability,
+    types::RequestOptions,
 };
 
 mod request;
@@ -17,14 +18,14 @@ mod stream;
 
 pub use stream::QwenStreamParser;
 
-/// `Qwen` 协议适配器。
+/// `Qwen` OpenAI-compatible 协议适配器。
 #[derive(Debug, Default)]
 pub struct QwenAdapter {
     stream_parser: Mutex<QwenStreamParser>,
 }
 
 impl QwenAdapter {
-    /// 创建 `Qwen` 协议适配器。
+    /// 创建 `Qwen` OpenAI-compatible 协议适配器。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -40,6 +41,18 @@ impl QwenAdapter {
 impl ProviderAdapter for QwenAdapter {
     fn provider(&self) -> Provider {
         Provider::Qwen
+    }
+
+    fn thinking_capability(&self, model: &str) -> ThinkingCapability {
+        if is_reasoning_model(model) {
+            ThinkingCapability {
+                supports_thinking: true,
+                supports_thinking_budget: true,
+                supports_reasoning_effort: false,
+            }
+        } else {
+            ThinkingCapability::default()
+        }
     }
 
     fn chat_path(&self) -> &'static str {
@@ -74,12 +87,16 @@ impl ProviderAdapter for QwenAdapter {
     }
 }
 
+fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("qwen3")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::QwenAdapter;
-    use crate::{Message, Provider, ProviderAdapter, client::RequestOptions};
+    use crate::{Message, Provider, ProviderAdapter, types::RequestOptions};
 
     #[test]
     fn adapter_exposes_qwen_provider_info() {
@@ -89,7 +106,18 @@ mod tests {
         assert_eq!(adapter.chat_path(), "/chat/completions");
         assert_eq!(
             adapter.default_base_url(),
-            Some("https://dashscope-intl.aliyuncs.com/api/v1")
+            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+        );
+        assert!(adapter.thinking_capability("qwen3-max").supports_thinking);
+        assert!(
+            adapter
+                .thinking_capability("qwen3-max")
+                .supports_thinking_budget
+        );
+        assert!(
+            !adapter
+                .thinking_capability("qwen-plus")
+                .supports_thinking_budget
         );
     }
 
@@ -98,7 +126,7 @@ mod tests {
         let adapter = QwenAdapter::new();
         let request = adapter
             .build_chat_request(
-                "qwen-max",
+                "qwen3-max",
                 &[Message::user("你好")],
                 None,
                 true,
@@ -106,21 +134,18 @@ mod tests {
             )
             .expect("请求体应构建成功");
 
-        assert_eq!(request["parameters"]["incremental_output"], true);
+        assert_eq!(request["stream"], true);
 
         let chunk = adapter
             .parse_stream_chunk(
                 &json!({
-                    "output": {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": "你"
-                                },
-                                "finish_reason": null
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": "你"
                             }
-                        ]
-                    }
+                        }
+                    ]
                 })
                 .to_string(),
             )

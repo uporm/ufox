@@ -46,8 +46,10 @@ tokio = { version = "1", features = ["full"] }
 
 ### 基础聊天
 
+默认请求选项推荐直接使用 `chat_messages(...)`：
+
 ```rust
-use ufox_llm::{ChatRequest, Client, Message, Provider};
+use ufox_llm::{Client, Message, Provider};
 
 #[tokio::main]
 async fn main() -> Result<(), ufox_llm::LlmError> {
@@ -62,8 +64,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
         Message::user("请用一句话介绍 Rust。"),
     ];
 
-    let request = ChatRequest::new(&messages).build();
-    let response = client.chat(&request).await?;
+    let response = client.chat_messages(&messages).await?;
     println!("{}", response.content);
 
     Ok(())
@@ -72,9 +73,11 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
 
 ### 流式输出
 
+默认请求选项推荐直接使用 `chat_stream_messages(...)`：
+
 ```rust
 use futures_util::StreamExt;
-use ufox_llm::{ChatRequest, Client, Message, Provider};
+use ufox_llm::{Client, Message, Provider};
 
 #[tokio::main]
 async fn main() -> Result<(), ufox_llm::LlmError> {
@@ -85,8 +88,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
         .build()?;
 
     let messages = vec![Message::user("请分三行介绍 Rust 的优势。")];
-    let request = ChatRequest::new(&messages).build();
-    let mut stream = client.chat_stream(&request).await?;
+    let mut stream = client.chat_stream_messages(&messages).await?;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -100,11 +102,43 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
 }
 ```
 
+### 请求模型
+
+需要为单次请求附加工具、思考模式或采样参数时，推荐使用 `ChatRequest` 作为统一入口：
+
+```rust
+use ufox_llm::{ChatRequest, Client, Message, Provider, ToolChoice};
+
+#[tokio::main]
+async fn main() -> Result<(), ufox_llm::LlmError> {
+    let client = Client::builder()
+        .provider(Provider::OpenAI)
+        .api_key("sk-xxx")
+        .model("gpt-4o")
+        .build()?;
+
+    let messages = vec![Message::user("请概括这段需求，并给出一个执行计划。")];
+    let request = ChatRequest::new(&messages)
+        .temperature(0.2)
+        .tool_choice(ToolChoice::Auto);
+
+    let response = client.chat(&request).await?;
+    println!("{}", response.content);
+    Ok(())
+}
+```
+
+说明：
+
+- `ChatRequest` 是对外推荐的请求入口，同时承载 `messages`、`tools` 和请求级配置
+- `RequestOptions` 也会作为公共类型导出，但更适合作为内部共享的参数载体来理解
+- `chat_messages(...)` / `chat_stream_messages(...)` 本质上分别是 `ChatRequest::new(...)` 的快捷封装
+
 ### 思考模式
 
 ```rust
 use futures_util::StreamExt;
-use ufox_llm::{ChatRequest, Client, DeltaType, Message, Provider, ReasoningEffort};
+use ufox_llm::{ChatRequest, Client, DeltaType, Message, Provider};
 
 #[tokio::main]
 async fn main() -> Result<(), ufox_llm::LlmError> {
@@ -118,9 +152,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
 
     let request = ChatRequest::new(&messages)
         .thinking(true)
-        .thinking_budget(8_000)
-        .reasoning_effort(ReasoningEffort::High)
-        .build();
+        .thinking_budget(8_000);
     let response = client.chat(&request).await?;
 
     if let Some(thinking) = response.thinking_content.as_deref() {
@@ -128,7 +160,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
     }
     println!("=== 最终回复 ===\n{}", response.content);
 
-    let stream_request = ChatRequest::new(&messages).thinking(true).build();
+    let stream_request = ChatRequest::new(&messages).thinking(true);
     let mut stream = client.chat_stream(&stream_request).await?;
     while let Some(chunk) = stream.next().await {
         match chunk?.delta_type() {
@@ -143,10 +175,33 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
 
 说明：
 
-- `Qwen3` 支持 `thinking(true)` 与 `thinking_budget(...)`
-- `OpenAI` `o1` / `o3` 系列支持 `reasoning_effort(...)`
+- `Qwen3` 支持 `thinking(true)` 与 `thinking_budget(...)`，会通过 Qwen OpenAI-compatible 扩展字段发送
+- `OpenAI` `o1` / `o3` 系列支持 `reasoning_effort(...)`；该参数不适用于 `Qwen`
 - `Compatible` 接入的 `deepseek-reasoner` 会解析 `reasoning_content`
 - 对不支持思考模式的模型，SDK 会静默忽略相关参数，并在 `debug` 级别输出提示日志
+
+如果你在 `OpenAI` 推理模型上需要设置 `reasoning_effort(...)`，可以这样写：
+
+```rust
+use ufox_llm::{ChatRequest, Client, Message, Provider, ReasoningEffort};
+
+#[tokio::main]
+async fn main() -> Result<(), ufox_llm::LlmError> {
+    let client = Client::builder()
+        .provider(Provider::OpenAI)
+        .api_key("sk-xxx")
+        .model("o3-mini")
+        .build()?;
+
+    let messages = vec![Message::user("请分析这段方案并给出取舍建议。")];
+    let request = ChatRequest::new(&messages)
+        .thinking(true)
+        .reasoning_effort(ReasoningEffort::High);
+
+    let _response = client.chat(&request).await?;
+    Ok(())
+}
+```
 
 ### 多轮对话
 
@@ -168,12 +223,12 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
         Message::user("请简要说明 Rust 所有权系统解决了什么问题。"),
     ];
 
-    let first_request = ChatRequest::new(&messages).build();
+    let first_request = ChatRequest::new(&messages);
     let first = client.chat(&first_request).await?;
     messages.push(Message::assistant(&first.content));
 
     messages.push(Message::user("请再补充两个它对并发编程的帮助点。"));
-    let second_request = ChatRequest::new(&messages).build();
+    let second_request = ChatRequest::new(&messages);
     let second = client.chat(&second_request).await?;
     messages.push(Message::assistant(&second.content));
 
@@ -185,8 +240,10 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
 
 当前版本使用 `MessageBuilder` 构造多模态消息：
 
+若无需额外请求选项，可直接使用 `chat_messages(...)`：
+
 ```rust
-use ufox_llm::{ChatRequest, Client, Message, MessageBuilder, Provider};
+use ufox_llm::{Client, Message, MessageBuilder, Provider};
 
 #[tokio::main]
 async fn main() -> Result<(), ufox_llm::LlmError> {
@@ -206,8 +263,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
         message,
     ];
 
-    let request = ChatRequest::new(&messages).build();
-    let response = client.chat(&request).await?;
+    let response = client.chat_messages(&messages).await?;
     println!("{}", response.content);
 
     Ok(())
@@ -258,8 +314,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
     let request = ChatRequest::new(&messages)
         .tools(&tools)
         .tool_choice(ToolChoice::function("get_weather"))
-        .parallel_tool_calls(true)
-        .build();
+        .parallel_tool_calls(true);
     let response = client.chat(&request).await?;
 
     if let Some(calls) = response.tool_calls.as_ref() {
@@ -283,7 +338,7 @@ async fn main() -> Result<(), ufox_llm::LlmError> {
             messages.push(Message::tool_result(&call.id, &result.content));
         }
 
-        let request = ChatRequest::new(&messages).build();
+        let request = ChatRequest::new(&messages);
         let final_response = client.chat(&request).await?;
         println!("{}", final_response.content);
     }
@@ -351,7 +406,7 @@ fn main() -> Result<(), ufox_llm::LlmError> {
     let client = Client::builder()
         .provider(Provider::Qwen)
         .api_key("sk-xxx")
-        .model("qwen-max")
+        .model("qwen3-max")
         .build()?;
 
     let _ = client;
@@ -361,7 +416,8 @@ fn main() -> Result<(), ufox_llm::LlmError> {
 
 说明：
 
-- SDK 会在 `Qwen` 流式请求时自动补齐 `X-DashScope-SSE: enable`
+- `Qwen` 现使用 OpenAI-compatible `Chat Completions` 协议，默认基地址为 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+- 对 `Qwen3` 这类支持思考模式的模型，可直接通过 `thinking(true)` 和 `thinking_budget(...)` 启用
 - 只有在你确实需要自定义网关或链路透传头时，才需要调用 `.extra_header(...)`
 
 ### Compatible

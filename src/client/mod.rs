@@ -9,17 +9,21 @@ use futures_util::{Stream, StreamExt, stream};
 use reqwest::{Response, StatusCode, header::RETRY_AFTER};
 
 use crate::{
-    ChatResponse, LlmError, Message, Provider, ProviderAdapter, ReasoningEffort, StreamChunk,
-    Tool, ToolChoice,
-    provider::{compatible::CompatibleAdapter, openai::OpenAiAdapter, qwen::QwenAdapter},
+    ChatResponse, LlmError, Message, Provider, ProviderAdapter, StreamChunk, Tool,
+    types::{ChatRequest, RequestOptions},
 };
 
 mod builder;
-mod config;
+mod debug;
 
-use self::config::{ProviderConfig, ThinkingCapability};
+use self::{
+    builder::ClientSettings,
+    debug::{
+        debug_chat_response, debug_ignored_request_option, debug_request, debug_request_failure,
+        debug_request_success, debug_stream_event,
+    },
+};
 
-pub use self::config::RequestOptions;
 pub use builder::ClientBuilder;
 
 /// 聊天流式响应类型。
@@ -27,145 +31,11 @@ pub use builder::ClientBuilder;
 /// 该类型是对异步流返回值的统一封装。流中的每一项都是一次增量输出或终止片段。
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send>>;
 
-/// 聊天请求构建器。
-///
-/// 该类型用于组装一次完整的聊天请求。请求本身拥有消息与工具定义的所有权，因此不会把
-/// 生命周期暴露到公开 API 中。
-#[derive(Debug, Clone)]
-pub struct ChatRequestBuilder {
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
-    options: RequestOptions,
-}
-
-/// 可复用的聊天请求快照。
-///
-/// 构建完成后可以分别交给 [`Client::chat`] 与 [`Client::chat_stream`] 执行。
-#[derive(Debug, Clone)]
-pub struct ChatRequest {
-    pub messages: Vec<Message>,
-    pub tools: Option<Vec<Tool>>,
-    pub options: RequestOptions,
-}
-
-impl ChatRequest {
-    pub fn new(messages: impl AsRef<[Message]>) -> ChatRequestBuilder {
-        ChatRequestBuilder {
-            messages: messages.as_ref().to_vec(),
-            tools: None,
-            options: RequestOptions::default(),
-        }
-    }
-}
-
-impl ChatRequestBuilder {
-    pub fn tools(mut self, tools: impl AsRef<[Tool]>) -> Self {
-        self.tools = Some(tools.as_ref().to_vec());
-        self
-    }
-
-    /// 添加供应商原生请求参数。
-    ///
-    /// `OpenAI` / `Compatible` 会把它写入请求体顶层，`Qwen` 会写入 `parameters`。
-    /// 当键名与库内置字段冲突时，内置字段优先，透传值会被忽略。
-    pub fn provider_option(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.options.provider_options.insert(key.into(), value.into());
-        self
-    }
-
-    /// 批量添加供应商原生请求参数。
-    ///
-    /// 参数落点与 [`Self::provider_option`] 一致；若同一键重复出现，后写入的值会覆盖先前值。
-    pub fn provider_options<I, K, V>(mut self, options: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<serde_json::Value>,
-    {
-        self.options.provider_options.extend(
-            options
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into())),
-        );
-        self
-    }
-
-    pub fn temperature(mut self, temperature: f32) -> Self {
-        self.options.temperature = Some(temperature);
-        self
-    }
-
-    pub fn top_p(mut self, top_p: f32) -> Self {
-        self.options.top_p = Some(top_p);
-        self
-    }
-
-    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
-        self.options.max_tokens = Some(max_tokens);
-        self
-    }
-
-    pub fn presence_penalty(mut self, presence_penalty: f32) -> Self {
-        self.options.presence_penalty = Some(presence_penalty);
-        self
-    }
-
-    pub fn frequency_penalty(mut self, frequency_penalty: f32) -> Self {
-        self.options.frequency_penalty = Some(frequency_penalty);
-        self
-    }
-
-    pub fn thinking(mut self, enabled: bool) -> Self {
-        self.options.thinking = enabled;
-        self
-    }
-
-    pub fn thinking_budget(mut self, budget: u32) -> Self {
-        self.options.thinking_budget = Some(budget);
-        self
-    }
-
-    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
-        self.options.reasoning_effort = Some(effort);
-        self
-    }
-
-    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
-        self.options.tool_choice = Some(tool_choice);
-        self
-    }
-
-    pub fn parallel_tool_calls(mut self, enabled: bool) -> Self {
-        self.options.parallel_tool_calls = Some(enabled);
-        self
-    }
-
-    pub fn build(self) -> ChatRequest {
-        ChatRequest {
-            messages: self.messages,
-            tools: self.tools,
-            options: self.options,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Client {
-    provider_config: ProviderConfig,
+    client_settings: ClientSettings,
     http: reqwest::Client,
     adapter: Arc<dyn ProviderAdapter>,
-}
-
-impl std::fmt::Debug for Client {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client")
-            .field("provider", &self.provider_config.provider)
-            .finish_non_exhaustive()
-    }
 }
 
 impl Client {
@@ -173,21 +43,23 @@ impl Client {
         ClientBuilder::new()
     }
 
-    fn from_builder(provider_config: ProviderConfig) -> Self {
-        let adapter = make_adapter(provider_config.provider);
+    fn from_builder(client_settings: ClientSettings) -> Self {
+        let adapter = client_settings.provider.make_adapter();
 
         Self {
-            provider_config,
+            client_settings,
             http: reqwest::Client::new(),
             adapter,
         }
     }
 
     pub const fn provider(&self) -> Provider {
-        self.provider_config.provider
+        self.client_settings.provider
     }
 
     /// 发送非流式聊天请求。
+    ///
+    /// 这是以 [`ChatRequest`] 为中心的主入口；当需要配置请求选项或工具调用时，优先使用该方法。
     /// # Errors
     /// - [`LlmError::ApiError`]：当 Provider 返回业务失败或本地关键配置缺失时触发
     /// - [`LlmError::AuthError`]：当接口返回 `401` 时触发
@@ -195,79 +67,45 @@ impl Client {
     /// - [`LlmError::NetworkError`]：当网络请求失败时触发
     /// - [`LlmError::ParseError`]：当响应体解析失败时触发
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.send_chat(&request.messages, request.tools.as_deref(), &request.options)
-            .await
+        let provider_name = self.adapter.provider_name().to_string();
+        let response = self
+            .send_request(
+                &request.messages,
+                request.tools.as_deref(),
+                false,
+                &request.options,
+            )
+            .await?;
+        let body = response.bytes().await.map_err(LlmError::from)?;
+        debug_chat_response(provider_name.as_str(), body.as_ref());
+        self.adapter.parse_chat_response(body.as_ref())
     }
 
     /// 发送流式聊天请求。
+    ///
+    /// 这是以 [`ChatRequest`] 为中心的流式主入口；当需要配置请求选项或工具调用时，优先使用该方法。
     /// # Errors
     /// - [`LlmError::ApiError`]：当 Provider 返回业务失败或本地关键配置缺失时触发
     /// - [`LlmError::AuthError`]：当接口返回 `401` 时触发
     /// - [`LlmError::RateLimitError`]：当接口返回 `429` 时触发
     /// - [`LlmError::NetworkError`]：当网络请求失败时触发
     pub async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatStream, LlmError> {
-        self.start_chat_stream(&request.messages, request.tools.as_deref(), &request.options)
-            .await
-    }
-
-    /// 使用默认请求选项发送非流式聊天请求。
-    ///
-    /// 当调用方无需额外配置 `thinking`、`tool_choice` 等参数时，可以直接使用该快捷方法。
-    pub async fn chat_messages(
-        &self,
-        messages: impl AsRef<[Message]>,
-    ) -> Result<ChatResponse, LlmError> {
-        let request = ChatRequest::new(messages).build();
-        self.chat(&request).await
-    }
-
-    /// 使用默认请求选项发送流式聊天请求。
-    ///
-    /// 当调用方无需额外配置请求选项时，可以直接使用该快捷方法。
-    pub async fn chat_stream_messages(
-        &self,
-        messages: impl AsRef<[Message]>,
-    ) -> Result<ChatStream, LlmError> {
-        let request = ChatRequest::new(messages).build();
-        self.chat_stream(&request).await
-    }
-
-    async fn send_chat(
-        &self,
-        messages: &[Message],
-        tools: Option<&[Tool]>,
-        options: &RequestOptions,
-    ) -> Result<ChatResponse, LlmError> {
         let provider_name = self.adapter.provider_name().to_string();
-        let response = self.send_request(messages, tools, false, options).await?;
-        let body = response.bytes().await.map_err(LlmError::from)?;
-        tracing::debug!(
-            provider = provider_name.as_str(),
-            response_body = %String::from_utf8_lossy(body.as_ref()),
-            "LLM 非流式响应"
-        );
-        self.adapter.parse_chat_response(body.as_ref())
-    }
-
-    async fn start_chat_stream(
-        &self,
-        messages: &[Message],
-        tools: Option<&[Tool]>,
-        options: &RequestOptions,
-    ) -> Result<ChatStream, LlmError> {
-        let provider_name = self.adapter.provider_name().to_string();
-        let response = self.send_request(messages, tools, true, options).await?;
+        let response = self
+            .send_request(
+                &request.messages,
+                request.tools.as_deref(),
+                true,
+                &request.options,
+            )
+            .await?;
         let adapter = Arc::clone(&self.adapter);
         let stream = response
             .bytes_stream()
             .eventsource()
             .map(move |event_result| match event_result {
                 Ok(event) => {
-                    tracing::debug!(
-                        provider = provider_name.as_str(),
-                        stream_event = %event.data,
-                        "LLM 流式响应事件"
-                    );
+                    debug_stream_event(provider_name.as_str(), &event.data);
                     match adapter.parse_stream_chunks(&event.data) {
                         Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
                         Err(error) => vec![Err(error)],
@@ -280,6 +118,32 @@ impl Client {
             .flat_map(stream::iter);
 
         Ok(Box::pin(stream))
+    }
+
+    /// 使用默认请求选项发送非流式聊天请求。
+    ///
+    /// 当调用方无需额外配置 `thinking`、`tool_choice` 等参数时，可以直接使用该快捷方法。
+    /// 该方法等价于先构造 `ChatRequest::new(messages)`，再调用 [`Self::chat`]。
+    /// 若后续需要增加请求级配置，可无缝切换到 `ChatRequest` 入口。
+    pub async fn chat_messages(
+        &self,
+        messages: impl AsRef<[Message]>,
+    ) -> Result<ChatResponse, LlmError> {
+        let request = ChatRequest::new(messages);
+        self.chat(&request).await
+    }
+
+    /// 使用默认请求选项发送流式聊天请求。
+    ///
+    /// 当调用方无需额外配置请求选项时，可以直接使用该快捷方法。
+    /// 该方法等价于先构造 `ChatRequest::new(messages)`，再调用 [`Self::chat_stream`]。
+    /// 若后续需要增加请求级配置，可无缝切换到 `ChatRequest` 入口。
+    pub async fn chat_stream_messages(
+        &self,
+        messages: impl AsRef<[Message]>,
+    ) -> Result<ChatStream, LlmError> {
+        let request = ChatRequest::new(messages);
+        self.chat_stream(&request).await
     }
 
     async fn send_request(
@@ -303,55 +167,49 @@ impl Client {
             .to_string()
         });
 
-        tracing::debug!(
-            provider = provider_name.as_str(),
+        debug_request(
+            provider_name.as_str(),
             model,
             stream,
-            request_url = %url,
-            request_body = %request_body_json,
-            "LLM 请求"
+            &url,
+            &request_body_json,
         );
 
         let mut request = self.http.post(url).json(&body);
         request = request.header(
             "Authorization",
-            format!("Bearer {}", self.provider_config.api_key),
+            format!("Bearer {}", self.client_settings.api_key),
         );
 
         request = apply_stream_headers(request, self.provider(), stream);
 
-        if let Some(timeout_secs) = self.provider_config.timeout_secs {
+        if let Some(timeout_secs) = self.client_settings.timeout_secs {
             request = request.timeout(Duration::from_secs(timeout_secs));
         }
 
         if self.provider() == Provider::OpenAI
-            && let Some(organization) = self.provider_config.organization.as_deref()
+            && let Some(organization) = self.client_settings.organization.as_deref()
         {
             request = request.header("OpenAI-Organization", organization);
         }
 
-        for (key, value) in &self.provider_config.extra_headers {
+        for (key, value) in &self.client_settings.extra_headers {
             request = request.header(key, value);
         }
 
         let response = request.send().await.map_err(LlmError::from)?;
         if response.status().is_success() {
-            tracing::debug!(
-                provider = provider_name.as_str(),
-                status = response.status().as_u16(),
-                "LLM 请求成功"
-            );
+            debug_request_success(provider_name.as_str(), response.status().as_u16());
             Ok(response)
         } else {
             let status = response.status();
             let retry_after = parse_retry_after_header(response.headers());
             let body = response.bytes().await.map_err(LlmError::from)?;
-            tracing::debug!(
-                provider = provider_name.as_str(),
-                status = status.as_u16(),
-                retry_after_secs = retry_after.map(|duration| duration.as_secs()),
-                response_body = %String::from_utf8_lossy(body.as_ref()),
-                "LLM 请求失败"
+            debug_request_failure(
+                provider_name.as_str(),
+                status.as_u16(),
+                retry_after,
+                body.as_ref(),
             );
             Err(map_http_error(
                 status,
@@ -364,7 +222,7 @@ impl Client {
 
     fn request_url(&self) -> Result<String, LlmError> {
         let base_url = self
-            .provider_config
+            .client_settings
             .base_url
             .as_deref()
             .or_else(|| self.adapter.default_base_url())
@@ -378,7 +236,7 @@ impl Client {
     }
 
     fn required_model(&self) -> Result<&str, LlmError> {
-        self.provider_config
+        self.client_settings
             .default_model
             .as_deref()
             .ok_or_else(|| LlmError::ApiError {
@@ -394,7 +252,8 @@ impl Client {
         tools: Option<&[Tool]>,
         options: &RequestOptions,
     ) -> RequestOptions {
-        let capability = thinking_capability(self.provider(), model);
+        let provider_name = self.provider().display_name();
+        let capability = self.adapter.thinking_capability(model);
         let mut resolved = RequestOptions {
             temperature: options.temperature,
             top_p: options.top_p,
@@ -409,10 +268,12 @@ impl Client {
             if capability.supports_thinking {
                 resolved.thinking = true;
             } else {
-                tracing::debug!(
-                    provider = self.provider().display_name(),
+                debug_ignored_request_option(
+                    provider_name,
                     model,
-                    "provider / model 不支持思考模式，thinking 参数已忽略"
+                    "thinking",
+                    Some("true"),
+                    "provider / model 不支持思考模式",
                 );
             }
         }
@@ -422,11 +283,13 @@ impl Client {
                 resolved.thinking = true;
                 resolved.thinking_budget = Some(thinking_budget);
             } else {
-                tracing::debug!(
-                    provider = self.provider().display_name(),
+                let thinking_budget_value = thinking_budget.to_string();
+                debug_ignored_request_option(
+                    provider_name,
                     model,
-                    thinking_budget,
-                    "provider / model 不支持 thinking_budget，参数已忽略"
+                    "thinking_budget",
+                    Some(thinking_budget_value.as_str()),
+                    "provider / model 不支持 thinking_budget",
                 );
             }
         }
@@ -435,11 +298,12 @@ impl Client {
             if capability.supports_reasoning_effort {
                 resolved.reasoning_effort = Some(reasoning_effort);
             } else {
-                tracing::debug!(
-                    provider = self.provider().display_name(),
+                debug_ignored_request_option(
+                    provider_name,
                     model,
-                    reasoning_effort = reasoning_effort.as_str(),
-                    "provider / model 不支持 reasoning_effort，参数已忽略"
+                    "reasoning_effort",
+                    Some(reasoning_effort.as_str()),
+                    "provider / model 不支持 reasoning_effort",
                 );
             }
         }
@@ -448,10 +312,12 @@ impl Client {
             if has_tools(tools) {
                 resolved.tool_choice = Some(tool_choice);
             } else {
-                tracing::debug!(
-                    provider = self.provider().display_name(),
+                debug_ignored_request_option(
+                    provider_name,
                     model,
-                    "当前请求未传入 tools，tool_choice 参数已忽略"
+                    "tool_choice",
+                    None,
+                    "当前请求未传入 tools",
                 );
             }
         }
@@ -460,11 +326,13 @@ impl Client {
             if has_tools(tools) {
                 resolved.parallel_tool_calls = Some(parallel_tool_calls);
             } else {
-                tracing::debug!(
-                    provider = self.provider().display_name(),
+                let parallel_tool_calls_value = parallel_tool_calls.to_string();
+                debug_ignored_request_option(
+                    provider_name,
                     model,
-                    parallel_tool_calls,
-                    "当前请求未传入 tools，parallel_tool_calls 参数已忽略"
+                    "parallel_tool_calls",
+                    Some(parallel_tool_calls_value.as_str()),
+                    "当前请求未传入 tools",
                 );
             }
         }
@@ -473,71 +341,27 @@ impl Client {
     }
 }
 
-fn make_adapter(provider: Provider) -> Arc<dyn ProviderAdapter> {
-    match provider {
-        Provider::OpenAI => Arc::new(OpenAiAdapter::new()),
-        Provider::Qwen => Arc::new(QwenAdapter::new()),
-        Provider::Compatible => Arc::new(CompatibleAdapter::new()),
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("provider", &self.client_settings.provider)
+            .finish_non_exhaustive()
     }
 }
-
-fn thinking_capability(provider: Provider, model: &str) -> ThinkingCapability {
-    match provider {
-        Provider::OpenAI if is_openai_reasoning_model(model) => ThinkingCapability {
-            supports_thinking: true,
-            supports_thinking_budget: false,
-            supports_reasoning_effort: true,
-        },
-        Provider::Qwen if is_qwen3_reasoning_model(model) => ThinkingCapability {
-            supports_thinking: true,
-            supports_thinking_budget: true,
-            supports_reasoning_effort: false,
-        },
-        Provider::Compatible if is_deepseek_reasoning_model(model) => ThinkingCapability {
-            supports_thinking: true,
-            supports_thinking_budget: false,
-            supports_reasoning_effort: false,
-        },
-        _ => ThinkingCapability::default(),
-    }
-}
-
-fn is_openai_reasoning_model(model: &str) -> bool {
-    model.starts_with("o1") || model.starts_with("o3")
-}
-
-fn is_qwen3_reasoning_model(model: &str) -> bool {
-    model.starts_with("qwen3")
-}
-
-fn is_deepseek_reasoning_model(model: &str) -> bool {
-    let normalized = model.rsplit_once('/').map_or(model, |(_, suffix)| suffix);
-    let normalized = normalized
-        .rsplit_once(':')
-        .map_or(normalized, |(_, suffix)| suffix);
-
-    normalized == "deepseek-reasoner"
-}
-
 fn has_tools(tools: Option<&[Tool]>) -> bool {
     matches!(tools, Some(items) if !items.is_empty())
 }
 
 fn apply_stream_headers(
     request: reqwest::RequestBuilder,
-    provider: Provider,
+    _provider: Provider,
     stream: bool,
 ) -> reqwest::RequestBuilder {
     if !stream {
         return request;
     }
 
-    let request = request.header("Accept", "text/event-stream");
-    if provider == Provider::Qwen {
-        request.header("X-DashScope-SSE", "enable")
-    } else {
-        request
-    }
+    request.header("Accept", "text/event-stream")
 }
 
 fn join_url(base_url: &str, path: &str) -> String {
@@ -598,10 +422,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRequest, Client, RequestOptions, apply_stream_headers, extract_error_message, join_url,
-        map_http_error, parse_retry_after_header,
+        Client, apply_stream_headers, extract_error_message, join_url, map_http_error,
+        parse_retry_after_header,
     };
-    use crate::{JsonType, LlmError, Message, Provider, ReasoningEffort, ToolChoice};
+    use crate::{LlmError, Provider, ReasoningEffort, ToolChoice, types::RequestOptions};
 
     #[test]
     fn client_provider() {
@@ -614,76 +438,6 @@ mod tests {
             .expect("应构建成功");
 
         assert_eq!(client.provider(), Provider::Compatible);
-    }
-
-    #[test]
-    fn chat_request_builder_owns_messages_tools_and_options() {
-        let messages = vec![Message::user("hello")];
-        let tools = [crate::Tool::function("get_weather")
-            .param("city", JsonType::String, "城市名称", true)
-            .build()];
-
-        let request = ChatRequest::new(&messages)
-            .tools(&tools)
-            .provider_option("max_completion_tokens", 4096)
-            .provider_option("metadata", json!({ "tier": "pro" }))
-            .temperature(0.7)
-            .top_p(0.9)
-            .max_tokens(2048)
-            .presence_penalty(0.3)
-            .frequency_penalty(0.1)
-            .thinking(true)
-            .tool_choice(ToolChoice::function("get_weather"))
-            .parallel_tool_calls(true)
-            .build();
-
-        assert_eq!(request.messages.len(), 1);
-        assert_eq!(request.tools.as_ref().map(Vec::len), Some(1));
-        assert_eq!(
-            request.options.provider_options.get("max_completion_tokens"),
-            Some(&json!(4096))
-        );
-        assert_eq!(
-            request.options.provider_options.get("metadata"),
-            Some(&json!({ "tier": "pro" }))
-        );
-        assert_eq!(request.options.temperature, Some(0.7));
-        assert_eq!(request.options.top_p, Some(0.9));
-        assert_eq!(request.options.max_tokens, Some(2048));
-        assert_eq!(request.options.presence_penalty, Some(0.3));
-        assert_eq!(request.options.frequency_penalty, Some(0.1));
-        assert!(request.options.thinking);
-        assert_eq!(request.options.parallel_tool_calls, Some(true));
-        assert_eq!(
-            request
-                .options
-                .tool_choice
-                .as_ref()
-                .and_then(ToolChoice::function_name),
-            Some("get_weather")
-        );
-    }
-
-    #[test]
-    fn chat_request_builder_accepts_provider_options_batch() {
-        let request = ChatRequest::new([Message::user("hello")])
-            .provider_option("seed", 7)
-            .provider_options([
-                ("seed", json!(8)),
-                ("metadata", json!({ "tier": "pro" })),
-                ("max_completion_tokens", json!(2048)),
-            ])
-            .build();
-
-        assert_eq!(request.options.provider_options.get("seed"), Some(&json!(8)));
-        assert_eq!(
-            request.options.provider_options.get("metadata"),
-            Some(&json!({ "tier": "pro" }))
-        );
-        assert_eq!(
-            request.options.provider_options.get("max_completion_tokens"),
-            Some(&json!(2048))
-        );
     }
 
     #[test]
@@ -736,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_stream_headers_adds_qwen_sse_header_for_qwen_streaming() {
+    fn apply_stream_headers_sets_sse_accept_header_for_qwen_streaming() {
         let client = reqwest::Client::new();
         let request = apply_stream_headers(
             client.post("https://example.com/chat"),
@@ -752,14 +506,11 @@ mod tests {
                 "text/event-stream"
             ))
         );
-        assert_eq!(
-            request.headers().get("X-DashScope-SSE"),
-            Some(&reqwest::header::HeaderValue::from_static("enable"))
-        );
+        assert!(request.headers().get("X-DashScope-SSE").is_none());
     }
 
     #[test]
-    fn apply_stream_headers_skips_qwen_sse_header_for_non_qwen_streaming() {
+    fn apply_stream_headers_sets_same_headers_for_non_qwen_streaming() {
         let client = reqwest::Client::new();
         let request = apply_stream_headers(
             client.post("https://example.com/chat"),

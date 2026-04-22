@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::{
     ChatResponse, LlmError, Message, Provider, ProviderAdapter, StreamChunk, Tool,
-    client::RequestOptions,
+    provider::ThinkingCapability,
+    types::RequestOptions,
 };
 
 pub(crate) mod request;
@@ -44,6 +45,18 @@ impl ProviderAdapter for OpenAiAdapter {
         Provider::OpenAI
     }
 
+    fn thinking_capability(&self, model: &str) -> ThinkingCapability {
+        if is_reasoning_model(model) {
+            ThinkingCapability {
+                supports_thinking: true,
+                supports_thinking_budget: false,
+                supports_reasoning_effort: true,
+            }
+        } else {
+            ThinkingCapability::default()
+        }
+    }
+
     fn chat_path(&self) -> &'static str {
         "/chat/completions"
     }
@@ -76,12 +89,16 @@ impl ProviderAdapter for OpenAiAdapter {
     }
 }
 
+fn is_reasoning_model(model: &str) -> bool {
+    model.starts_with("o1") || model.starts_with("o3")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::OpenAiAdapter;
-    use crate::{Message, Provider, ProviderAdapter, client::RequestOptions};
+    use crate::{Message, Provider, ProviderAdapter, types::RequestOptions};
 
     #[test]
     fn adapter_exposes_openai_provider_info() {
@@ -93,6 +110,13 @@ mod tests {
             adapter.default_base_url(),
             Some("https://api.openai.com/v1")
         );
+        assert!(adapter.thinking_capability("o3-mini").supports_thinking);
+        assert!(
+            adapter
+                .thinking_capability("o3-mini")
+                .supports_reasoning_effort
+        );
+        assert!(!adapter.thinking_capability("gpt-4o").supports_thinking);
     }
 
     #[test]

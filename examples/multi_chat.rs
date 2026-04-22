@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
         Message::user("请简要说明 Rust 所有权系统解决了什么问题。"),
     ];
 
-    let first_request = ChatRequest::new(&messages).build();
+    let first_request = ChatRequest::new(&messages);
     let first = client
         .chat(&first_request)
         .await
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
 
     messages.push(Message::user("请再补充两个它对并发编程的帮助点。"));
 
-    let second_request = ChatRequest::new(&messages).build();
+    let second_request = ChatRequest::new(&messages);
     let second = client
         .chat(&second_request)
         .await
@@ -101,7 +101,7 @@ fn optional_env(key: &str) -> Option<String> {
 fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAI => "gpt-4o",
-        Provider::Qwen => "qwen-max",
+        Provider::Qwen => "qwen3-max",
         Provider::Compatible => "deepseek-chat",
     }
 }

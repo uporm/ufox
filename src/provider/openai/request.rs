@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     AudioFile, AudioSource, Content, ContentPart, ImageFile, ImageSource, JsonType, LlmError,
     Message, ReasoningEffort, Role, Tool, ToolChoice, VideoFile, VideoSource,
-    client::RequestOptions,
+    types::RequestOptions,
 };
 
 /// 将公共聊天参数转换为 `OpenAI` 私有请求体。
@@ -475,7 +475,7 @@ mod tests {
     use serde_json::json;
 
     use super::build_chat_request;
-    use crate::{JsonType, Message, MessageBuilder, Role, Tool, client::RequestOptions};
+    use crate::{JsonType, Message, MessageBuilder, Role, Tool, types::RequestOptions};
 
     #[test]
     fn openai() {

@@ -60,8 +60,7 @@ async fn main() -> Result<()> {
     let request = ChatRequest::new(&messages)
         .tools(&tools)
         .tool_choice(ToolChoice::Auto)
-        .parallel_tool_calls(true)
-        .build();
+        .parallel_tool_calls(true);
     let response = client.chat(&request).await.context("工具调用请求失败")?;
 
     if let Some(calls) = response.tool_calls.as_ref() {
@@ -79,7 +78,7 @@ async fn main() -> Result<()> {
             messages.push(Message::tool_result(&call.id, &result.content));
         }
 
-        let request = ChatRequest::new(&messages).build();
+        let request = ChatRequest::new(&messages);
         let final_response = client
             .chat(&request)
             .await
@@ -159,7 +158,7 @@ fn optional_env(key: &str) -> Option<String> {
 fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAI => "gpt-4o",
-        Provider::Qwen => "qwen-max",
+        Provider::Qwen => "qwen3-max",
         Provider::Compatible => "deepseek-chat",
     }
 }

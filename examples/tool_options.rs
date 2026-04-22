@@ -50,8 +50,7 @@ async fn main() -> Result<()> {
     let request = ChatRequest::new(&messages)
         .tools(&tools)
         .tool_choice(ToolChoice::Auto)
-        .parallel_tool_calls(true)
-        .build();
+        .parallel_tool_calls(true);
     let response = client
         .chat(&request)
         .await
@@ -106,7 +105,7 @@ fn optional_env(key: &str) -> Option<String> {
 fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAI => "gpt-4o",
-        Provider::Qwen => "qwen-max",
+        Provider::Qwen => "qwen3-max",
         Provider::Compatible => "deepseek-chat",
     }
 }

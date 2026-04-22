@@ -3,7 +3,7 @@
 //! 该示例演示如何：
 //! 1. 从环境变量读取 Provider、API Key、模型与可选基础地址；
 //! 2. 构建一个 [`ufox_llm::Client`]；
-//! 3. 构造 `ChatRequest` 并调用 `chat_stream()` 获取流式响应；
+//! 3. 使用默认请求选项快捷入口 `chat_stream_messages()` 获取流式响应；
 //! 4. 使用 `futures_util::StreamExt` 逐段消费文本增量，并在结束时打印结束原因与用量。
 //!
 //! 运行前请至少设置：
@@ -19,7 +19,7 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use tracing_subscriber::EnvFilter;
-use ufox_llm::{ChatRequest, Client, Message, Provider};
+use ufox_llm::{Client, Message, Provider};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,9 +44,8 @@ async fn main() -> Result<()> {
         Message::user("请分三行简要介绍 Rust 的优势。"),
     ];
 
-    let request = ChatRequest::new(&messages).build();
     let mut stream = client
-        .chat_stream(&request)
+        .chat_stream_messages(&messages)
         .await
         .context("发起流式聊天失败")?;
 
@@ -108,7 +107,7 @@ fn optional_env(key: &str) -> Option<String> {
 fn default_model(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAI => "gpt-4o",
-        Provider::Qwen => "qwen-max",
+        Provider::Qwen => "qwen3-max",
         Provider::Compatible => "deepseek-chat",
     }
 }

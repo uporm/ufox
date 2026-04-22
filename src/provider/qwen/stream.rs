@@ -1,16 +1,15 @@
 //! `Qwen` 流式解析。
 //!
-//! 解析单条 `SSE` 事件并转换为公共 `StreamChunk`。
+//! 复用 Qwen OpenAI-compatible 的 `SSE` 事件解析逻辑。
 
-use serde::Deserialize;
-use serde_json::Value;
+use crate::{LlmError, StreamChunk};
 
-use crate::{FinishReason, LlmError, StreamChunk, ToolCall, Usage};
+use crate::provider::openai::OpenAiStreamParser;
 
-/// `Qwen` 流式事件解析器。
+/// `Qwen` OpenAI-compatible 流式事件解析器。
 #[derive(Debug, Default)]
 pub struct QwenStreamParser {
-    pending_tool_calls: Vec<PartialToolCall>,
+    inner: OpenAiStreamParser,
 }
 
 impl QwenStreamParser {
@@ -22,7 +21,7 @@ impl QwenStreamParser {
 
     /// 重置内部累积状态。
     pub fn reset(&mut self) {
-        self.pending_tool_calls.clear();
+        self.inner.reset();
     }
 
     /// 解析单条 `SSE` 事件的 `data:` 文本。
@@ -30,7 +29,9 @@ impl QwenStreamParser {
     /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
     /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
     pub fn parse_event(&mut self, event_data: &str) -> Result<Option<StreamChunk>, LlmError> {
-        Ok(self.parse_event_chunks(event_data)?.into_iter().last())
+        self.inner
+            .parse_event(event_data)
+            .map_err(rewrite_provider_in_stream_error)
     }
 
     /// 解析单条 `SSE` 事件并返回其中全部片段。
@@ -38,239 +39,24 @@ impl QwenStreamParser {
     /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
     /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
     pub fn parse_event_chunks(&mut self, event_data: &str) -> Result<Vec<StreamChunk>, LlmError> {
-        if is_done_event(event_data) {
-            self.reset();
-            return Ok(Vec::new());
-        }
-
-        let response: QwenStreamResponse = serde_json::from_str(event_data)?;
-
-        if response.output.choices.is_empty() {
-            return Ok(response
-                .usage
-                .map(|usage| {
-                    vec![
-                        StreamChunk::new("")
-                            .with_usage(Usage::new(usage.input_tokens, usage.output_tokens)),
-                    ]
-                })
-                .unwrap_or_default());
-        }
-
-        let choice =
-            response.output.choices.into_iter().next().ok_or_else(|| {
-                LlmError::StreamError("Qwen 流式事件缺少 output.choices".to_string())
-            })?;
-
-        let reasoning_delta = choice.message.reasoning_content.unwrap_or_default();
-        let delta_text = choice.message.content.into_text();
-        if let Some(tool_calls) = choice.message.tool_calls {
-            self.merge_tool_call_deltas(tool_calls);
-        }
-
-        let mut chunks = Vec::new();
-        if !reasoning_delta.is_empty() {
-            chunks.push(StreamChunk::thinking(reasoning_delta));
-        }
-        if !delta_text.is_empty() {
-            chunks.push(StreamChunk::new(delta_text));
-        }
-
-        let mut has_effective_data = chunks.iter().any(|chunk| !chunk.delta.is_empty());
-        if chunks.is_empty() {
-            chunks.push(StreamChunk::new(""));
-        }
-
-        if let Some(finish_reason) = choice.finish_reason.map(FinishReason::from) {
-            if finish_reason.is_tool_calls() {
-                let tool_calls = self.take_completed_tool_calls()?;
-                if !tool_calls.is_empty() {
-                    let chunk = chunks
-                        .last_mut()
-                        .expect("chunks 在附加工具调用前一定至少有一个元素");
-                    *chunk = chunk.clone().with_tool_calls(tool_calls);
-                }
-            }
-
-            let chunk = chunks
-                .last_mut()
-                .expect("chunks 在附加结束原因前一定至少有一个元素");
-            *chunk = chunk.clone().with_finish_reason(finish_reason);
-            has_effective_data = true;
-        }
-
-        if let Some(usage) = response
-            .usage
-            .map(|usage| Usage::new(usage.input_tokens, usage.output_tokens))
-        {
-            let chunk = chunks
-                .last_mut()
-                .expect("chunks 在附加 usage 前一定至少有一个元素");
-            *chunk = chunk.clone().with_usage(usage);
-            has_effective_data = true;
-        }
-
-        if has_effective_data {
-            Ok(chunks)
-        } else {
-            Ok(Vec::new())
-        }
+        self.inner
+            .parse_event_chunks(event_data)
+            .map_err(rewrite_provider_in_stream_error)
     }
+}
 
-    fn merge_tool_call_deltas(&mut self, deltas: Vec<QwenToolCallDelta>) {
-        for delta in deltas {
-            let index = delta.index;
-            while self.pending_tool_calls.len() <= index {
-                self.pending_tool_calls.push(PartialToolCall::default());
-            }
-
-            let entry = &mut self.pending_tool_calls[index];
-            if let Some(id) = delta.id {
-                entry.id.push_str(&id);
-            }
-
-            if let Some(function) = delta.function {
-                if let Some(name) = function.name {
-                    entry.name.push_str(&name);
-                }
-
-                if let Some(arguments) = function.arguments {
-                    entry.arguments.push_str(&arguments);
-                }
-            }
-        }
-    }
-
-    fn take_completed_tool_calls(&mut self) -> Result<Vec<ToolCall>, LlmError> {
-        let pending = std::mem::take(&mut self.pending_tool_calls);
-        pending
-            .into_iter()
-            .enumerate()
-            .map(|(index, partial)| {
-                if partial.id.is_empty() || partial.name.is_empty() {
-                    return Err(LlmError::StreamError(format!(
-                        "Qwen 工具调用流式片段不完整：索引 {index} 缺少 id 或 name"
-                    )));
-                }
-
-                Ok(ToolCall::new(partial.id, partial.name, partial.arguments))
-            })
-            .collect()
+fn rewrite_provider_in_stream_error(error: LlmError) -> LlmError {
+    match error {
+        LlmError::StreamError(message) => LlmError::StreamError(message.replace("OpenAI", "Qwen")),
+        other => other,
     }
 }
 
 /// 判断事件是否为 `[DONE]` 终止标记。
+#[cfg(test)]
 #[must_use]
 pub fn is_done_event(event_data: &str) -> bool {
     event_data.trim() == "[DONE]"
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenStreamResponse {
-    output: QwenOutput,
-    #[serde(default)]
-    usage: Option<QwenUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenOutput {
-    #[serde(default)]
-    choices: Vec<QwenChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenChoice {
-    message: QwenMessageDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenMessageDelta {
-    #[serde(default)]
-    content: QwenDeltaContent,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<QwenToolCallDelta>>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(untagged)]
-enum QwenDeltaContent {
-    Text(String),
-    Parts(Vec<QwenDeltaContentPart>),
-    #[default]
-    Empty,
-}
-
-impl QwenDeltaContent {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text(text) => text,
-            Self::Parts(parts) => parts
-                .into_iter()
-                .map(QwenDeltaContentPart::into_text)
-                .collect::<String>(),
-            Self::Empty => String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum QwenDeltaContentPart {
-    Text { text: String },
-    Refusal { refusal: String },
-    Image { image: String },
-    Other(Value),
-}
-
-impl QwenDeltaContentPart {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text { text } => text,
-            Self::Refusal { refusal } => refusal,
-            Self::Image { image } => {
-                let _ = image;
-                String::new()
-            }
-            Self::Other(value) => {
-                let _ = value;
-                String::new()
-            }
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenToolCallDelta {
-    index: usize,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<QwenToolFunctionDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenToolFunctionDelta {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QwenUsage {
-    input_tokens: u32,
-    output_tokens: u32,
-}
-
-#[derive(Debug, Default)]
-struct PartialToolCall {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 #[cfg(test)]
@@ -281,7 +67,7 @@ mod tests {
     use crate::FinishReason;
 
     #[test]
-    fn done_chunk() {
+    fn qwen_openai_compatible_done_chunk() {
         let mut parser = QwenStreamParser::new();
 
         let chunk = parser.parse_event("[DONE]").expect("事件应解析成功");
@@ -291,18 +77,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_test() {
+    fn qwen_openai_compatible_text_stream() {
         let body = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "你"
-                        },
-                        "finish_reason": null
-                    }
-                ]
-            }
+            "choices": [
+                {
+                    "delta": {
+                        "content": "你"
+                    },
+                    "finish_reason": null
+                }
+            ]
         })
         .to_string();
         let mut parser = QwenStreamParser::new();
@@ -317,18 +101,16 @@ mod tests {
     }
 
     #[test]
-    fn stop() {
+    fn qwen_openai_compatible_stop_chunk() {
         let body = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "content": ""
-                        },
-                        "finish_reason": "stop"
-                    }
-                ]
-            }
+            "choices": [
+                {
+                    "delta": {
+                        "content": ""
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
         })
         .to_string();
         let mut parser = QwenStreamParser::new();
@@ -343,48 +125,44 @@ mod tests {
     }
 
     #[test]
-    fn stream_test_2() {
+    fn qwen_openai_compatible_tool_call_stream() {
         let mut parser = QwenStreamParser::new();
         let first = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "call_1",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": "{\"city\":"
-                                    }
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{\"city\":"
                                 }
-                            ]
-                        },
-                        "finish_reason": null
-                    }
-                ]
-            }
+                            }
+                        ]
+                    },
+                    "finish_reason": null
+                }
+            ]
         })
         .to_string();
         let second = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "function": {
-                                        "arguments": "\"杭州\"}"
-                                    }
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "arguments": "\"杭州\"}"
                                 }
-                            ]
-                        },
-                        "finish_reason": "tool_calls"
-                    }
-                ]
-            }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
         })
         .to_string();
 
@@ -408,14 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn usage() {
+    fn qwen_openai_compatible_usage_chunk() {
         let body = json!({
-            "output": {
-                "choices": []
-            },
+            "choices": [],
             "usage": {
-                "input_tokens": 12,
-                "output_tokens": 8,
+                "prompt_tokens": 12,
+                "completion_tokens": 8,
                 "total_tokens": 20
             }
         })
@@ -431,18 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_qwen() {
+    fn qwen_openai_compatible_reasoning_chunk() {
         let body = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "reasoning_content": "先分析"
-                        },
-                        "finish_reason": null
-                    }
-                ]
-            }
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": "先分析"
+                    },
+                    "finish_reason": null
+                }
+            ]
         })
         .to_string();
         let mut parser = QwenStreamParser::new();
@@ -457,19 +231,17 @@ mod tests {
     }
 
     #[test]
-    fn qwen() {
+    fn qwen_openai_compatible_reasoning_and_text_chunks() {
         let body = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "reasoning_content": "先分析",
-                            "content": "最终答案"
-                        },
-                        "finish_reason": null
-                    }
-                ]
-            }
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": "先分析",
+                        "content": "最终答案"
+                    },
+                    "finish_reason": null
+                }
+            ]
         })
         .to_string();
         let mut parser = QwenStreamParser::new();
@@ -484,19 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_event_qwen() {
+    fn qwen_openai_compatible_parse_event_returns_last_chunk() {
         let body = json!({
-            "output": {
-                "choices": [
-                    {
-                        "message": {
-                            "reasoning_content": "先分析",
-                            "content": "最终答案"
-                        },
-                        "finish_reason": null
-                    }
-                ]
-            }
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": "先分析",
+                        "content": "最终答案"
+                    },
+                    "finish_reason": null
+                }
+            ]
         })
         .to_string();
         let mut parser = QwenStreamParser::new();

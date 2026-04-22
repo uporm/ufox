@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use crate::{
     ChatResponse, LlmError, Message, Provider, ProviderAdapter, StreamChunk, Tool,
-    client::RequestOptions,
+    provider::ThinkingCapability,
+    types::RequestOptions,
 };
 
 mod stream;
@@ -40,6 +41,18 @@ impl CompatibleAdapter {
 impl ProviderAdapter for CompatibleAdapter {
     fn provider(&self) -> Provider {
         Provider::Compatible
+    }
+
+    fn thinking_capability(&self, model: &str) -> ThinkingCapability {
+        if is_deepseek_reasoning_model(model) {
+            ThinkingCapability {
+                supports_thinking: true,
+                supports_thinking_budget: false,
+                supports_reasoning_effort: false,
+            }
+        } else {
+            ThinkingCapability::default()
+        }
     }
 
     fn chat_path(&self) -> &'static str {
@@ -76,12 +89,21 @@ impl ProviderAdapter for CompatibleAdapter {
     }
 }
 
+fn is_deepseek_reasoning_model(model: &str) -> bool {
+    let normalized = model.rsplit_once('/').map_or(model, |(_, suffix)| suffix);
+    let normalized = normalized
+        .rsplit_once(':')
+        .map_or(normalized, |(_, suffix)| suffix);
+
+    normalized == "deepseek-reasoner"
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::CompatibleAdapter;
-    use crate::{LlmError, Message, Provider, ProviderAdapter, client::RequestOptions};
+    use crate::{LlmError, Message, Provider, ProviderAdapter, types::RequestOptions};
 
     #[test]
     fn adapter_exposes_compatible_provider_info() {
@@ -91,6 +113,16 @@ mod tests {
         assert_eq!(adapter.chat_path(), "/chat/completions");
         assert_eq!(adapter.default_base_url(), None);
         assert_eq!(adapter.provider_name(), "compatible");
+        assert!(
+            adapter
+                .thinking_capability("vendor/deepseek-reasoner")
+                .supports_thinking
+        );
+        assert!(
+            !adapter
+                .thinking_capability("vendor/deepseek-chat")
+                .supports_thinking
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! 1. 从环境变量读取 Provider、API Key、模型与可选基础地址；
 //! 2. 构建一个 [`ufox_llm::Client`]；
 //! 3. 使用 [`ufox_llm::MessageBuilder`] 构造包含文本与图片的多模态消息；
-//! 4. 构造 `ChatRequest`，调用非流式 `chat()` 并打印模型回复。
+//! 4. 使用默认请求选项快捷入口 `chat_messages()` 发起多模态请求并打印模型回复。
 //!
 //! 运行前请至少设置：
 //! - `UFOX_LLM_PROVIDER`：`openai` / `qwen` / `compatible`
@@ -22,7 +22,7 @@ use std::env;
 
 use anyhow::{Context, Result, bail};
 use tracing_subscriber::EnvFilter;
-use ufox_llm::{ChatRequest, Client, Message, MessageBuilder, Provider};
+use ufox_llm::{Client, Message, MessageBuilder, Provider};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,8 +52,10 @@ async fn main() -> Result<()> {
         multimodal_message,
     ];
 
-    let request = ChatRequest::new(&messages).build();
-    let response = client.chat(&request).await.context("多模态请求失败")?;
+    let response = client
+        .chat_messages(&messages)
+        .await
+        .context("多模态请求失败")?;
 
     println!("模型回复：\n{}", response.content);
 
