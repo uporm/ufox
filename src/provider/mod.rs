@@ -1,159 +1,174 @@
-//! Provider 抽象。
-//!
-//! 定义 `Provider` 与 `ProviderAdapter`，统一协议构建和响应解析接口。
+mod anthropic;
+mod doubao;
+mod gemini;
+mod openai;
+mod qwen;
 
-use std::sync::Arc;
+use std::pin::Pin;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use async_trait::async_trait;
+use futures::Stream;
 
-use crate::{ChatResponse, LlmError, Message, RequestOptions, StreamChunk, Tool};
-
-use self::{
-    compatible::CompatibleAdapter,
-    openai::OpenAiAdapter,
-    qwen::QwenAdapter,
+use crate::{
+    error::LlmError,
+    types::{
+        request::{
+            ChatRequest, EmbeddingRequest, ImageGenRequest, SpeechToTextRequest,
+            TextToSpeechRequest, VideoGenRequest,
+        },
+        response::{
+            ChatChunk, ChatResponse, EmbeddingResponse, ImageGenResponse, SpeechToTextResponse,
+            TextToSpeechResponse, VideoGenResponse,
+        },
+    },
 };
 
-pub(crate) mod compatible;
-pub(crate) mod openai;
-pub(crate) mod qwen;
+#[async_trait]
+pub(crate) trait ProviderAdapter: Send + Sync {
+    /// 返回稳定的 provider 名称，用于错误字段、日志与指标标签。
+    fn name(&self) -> &'static str;
 
-/// `LLM` 供应商类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+    async fn chat(&self, model: &str, req: ChatRequest) -> Result<ChatResponse, LlmError>;
+
+    async fn chat_stream(
+        &self,
+        model: &str,
+        req: ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>, LlmError>;
+
+    async fn embed(
+        &self,
+        _model: &str,
+        _req: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "embed".into(),
+        })
+    }
+
+    async fn speech_to_text(
+        &self,
+        _model: &str,
+        _req: SpeechToTextRequest,
+    ) -> Result<SpeechToTextResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "speech_to_text".into(),
+        })
+    }
+
+    async fn text_to_speech(
+        &self,
+        _model: &str,
+        _req: TextToSpeechRequest,
+    ) -> Result<TextToSpeechResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "text_to_speech".into(),
+        })
+    }
+
+    async fn generate_image(
+        &self,
+        _model: &str,
+        _req: ImageGenRequest,
+    ) -> Result<ImageGenResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "generate_image".into(),
+        })
+    }
+
+    async fn generate_video(
+        &self,
+        _model: &str,
+        _req: VideoGenRequest,
+    ) -> Result<VideoGenResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "generate_video".into(),
+        })
+    }
+
+    async fn poll_video_task(&self, _task_id: &str) -> Result<VideoGenResponse, LlmError> {
+        Err(LlmError::UnsupportedCapability {
+            provider: Some(self.name().into()),
+            capability: "poll_video_task".into(),
+        })
+    }
+}
+
+/// 协议名称与 adapter 工厂，二者合一。
+#[derive(Debug, Clone)]
 pub enum Provider {
-    /// `OpenAI` 官方协议。
-    OpenAI,
-    /// 阿里云 `Qwen` OpenAI-compatible 协议。
-    Qwen,
-    /// 与 `OpenAI` `Chat Completions` 协议兼容的第三方服务。
+    /// OpenAI 兼容协议，必须由 ClientBuilder 显式提供 base_url。
     Compatible,
+    /// 标准 OpenAI 协议。
+    OpenAI,
+    /// Anthropic Messages 协议。
+    Anthropic,
+    /// 豆包协议。
+    Doubao,
+    /// 通义千问协议。
+    Qwen,
+    /// Google Gemini 协议。
+    Gemini,
 }
 
 impl Provider {
-    pub const fn as_str(self) -> &'static str {
+    /// 返回稳定的 provider 名称字符串。
+    pub fn name(&self) -> &'static str {
         match self {
-            Self::OpenAI => "openai",
-            Self::Qwen => "qwen",
-            Self::Compatible => "compatible",
+            Provider::Compatible => "compatible",
+            Provider::OpenAI => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Doubao => "doubao",
+            Provider::Qwen => "qwen",
+            Provider::Gemini => "gemini",
         }
     }
 
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::OpenAI => "OpenAI",
-            Self::Qwen => "Qwen",
-            Self::Compatible => "Compatible",
+    /// 根据稳定名称解析 provider。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "compatible" => Some(Provider::Compatible),
+            "openai" => Some(Provider::OpenAI),
+            "anthropic" => Some(Provider::Anthropic),
+            "doubao" => Some(Provider::Doubao),
+            "qwen" => Some(Provider::Qwen),
+            "gemini" => Some(Provider::Gemini),
+            _ => None,
         }
     }
 
-    pub const fn default_base_url(self) -> Option<&'static str> {
+    /// 返回该 provider 的默认 base URL。
+    pub fn default_base_url(&self) -> Option<&'static str> {
         match self {
-            Self::OpenAI => Some("https://api.openai.com/v1"),
-            Self::Qwen => Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
-            Self::Compatible => None,
+            Provider::OpenAI => Some("https://api.openai.com/v1"),
+            Provider::Anthropic => Some("https://api.anthropic.com"),
+            Provider::Doubao => Some("https://ark.cn-beijing.volces.com/api/v3"),
+            Provider::Qwen => Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            Provider::Gemini => Some("https://generativelanguage.googleapis.com/v1beta"),
+            Provider::Compatible => None,
         }
     }
 
-    pub const fn requires_explicit_base_url(self) -> bool {
-        self.default_base_url().is_none()
-    }
-
-    pub(crate) fn make_adapter(self) -> Arc<dyn ProviderAdapter> {
-        match self {
-            Self::OpenAI => Arc::new(OpenAiAdapter::new()),
-            Self::Qwen => Arc::new(QwenAdapter::new()),
-            Self::Compatible => Arc::new(CompatibleAdapter::new()),
-        }
-    }
-}
-
-/// 供应商协议适配器。
-pub trait ProviderAdapter: Send + Sync {
-    fn provider(&self) -> Provider;
-
-    fn provider_name(&self) -> &'static str {
-        self.provider().as_str()
-    }
-
-    fn default_base_url(&self) -> Option<&'static str> {
-        self.provider().default_base_url()
-    }
-
-    fn thinking_capability(&self, _model: &str) -> ThinkingCapability {
-        ThinkingCapability::default()
-    }
-
-    fn chat_path(&self) -> &'static str;
-
-    /// 构建供应商私有请求体。
-    /// # Errors
-    /// - [`LlmError::UnsupportedFeature`]：当当前供应商不支持某项请求能力时触发
-    /// - [`LlmError::StreamError`]：当流式请求体需要额外校验且校验失败时触发
-    fn build_chat_request(
+    /// adapter 创建的唯一入口。
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn into_adapter(
         &self,
-        model: &str,
-        messages: &[Message],
-        tools: Option<&[Tool]>,
-        stream: bool,
-        options: &RequestOptions,
-    ) -> Result<Value, LlmError>;
-
-    /// 解析非流式响应体。
-    /// # Errors
-    /// - [`LlmError::ParseError`]：当响应体不是合法 `JSON` 时触发
-    /// - [`LlmError::ApiError`]：当响应体内部表示业务失败时触发
-    fn parse_chat_response(&self, body: &[u8]) -> Result<ChatResponse, LlmError>;
-
-    /// 解析单条流式事件的数据部分。
-    /// # Errors
-    /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
-    /// - [`LlmError::StreamError`]：当事件数据格式非法或语义不完整时触发
-    fn parse_stream_chunk(&self, event_data: &str) -> Result<Option<StreamChunk>, LlmError>;
-
-    /// 解析单条流式事件，并返回该事件内包含的所有公共增量片段。
-    /// # Errors
-    /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
-    /// - [`LlmError::StreamError`]：当事件数据格式非法或语义不完整时触发
-    fn parse_stream_chunks(&self, event_data: &str) -> Result<Vec<StreamChunk>, LlmError> {
-        Ok(self.parse_stream_chunk(event_data)?.into_iter().collect())
-    }
-
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn supports_multimodal(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ThinkingCapability {
-    /// 是否支持启用 thinking 模式。
-    pub(crate) supports_thinking: bool,
-    /// 是否支持设置 thinking budget。
-    pub(crate) supports_thinking_budget: bool,
-    /// 是否支持设置 reasoning effort。
-    pub(crate) supports_reasoning_effort: bool,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Provider;
-
-    #[test]
-    fn provider_2() {
-        assert_eq!(Provider::OpenAI.display_name(), "OpenAI");
-        assert_eq!(
-            Provider::OpenAI.default_base_url(),
-            Some("https://api.openai.com/v1")
-        );
-        assert_eq!(
-            Provider::Qwen.default_base_url(),
-            Some("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-        );
-        assert!(Provider::Compatible.requires_explicit_base_url());
+        api_key: &str,
+        base_url: &str,
+        transport: &crate::middleware::Transport,
+    ) -> Result<Box<dyn ProviderAdapter>, LlmError> {
+        match self {
+            Provider::Compatible => openai::build("compatible", api_key, base_url, transport),
+            Provider::OpenAI => openai::build("openai", api_key, base_url, transport),
+            Provider::Anthropic => anthropic::build(api_key, base_url, transport),
+            Provider::Doubao => doubao::build(api_key, base_url, transport),
+            Provider::Qwen => qwen::build(api_key, base_url, transport),
+            Provider::Gemini => gemini::build(api_key, base_url, transport),
+        }
     }
 }

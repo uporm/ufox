@@ -1,67 +1,122 @@
-//! 错误类型。
-//!
-//! 统一定义 SDK 对外错误枚举。
-
-use std::time::Duration;
-
-use thiserror::Error;
-
-/// SDK 对外统一暴露的错误类型。
-///
-/// 该枚举覆盖了调用 LLM Provider 时常见的错误来源，包括鉴权失败、限流、
-/// 网络异常、响应解析失败以及 Provider 不支持某项能力等场景。
-#[derive(Debug, Error)]
+#[derive(thiserror::Error, Debug)]
 pub enum LlmError {
-    /// Provider 返回了非预期的业务错误。
-    ///
-    /// 该变体用于保留 HTTP 状态码、错误消息以及 Provider 名称，便于上层统一记录。
-    #[error("调用 {provider} 接口失败（状态码：{status_code}）：{message}")]
-    ApiError {
-        /// HTTP 状态码。
-        status_code: u16,
-        /// Provider 返回的错误消息。
+    #[error("缺少必填配置项：{field}")]
+    MissingConfig { field: &'static str },
+
+    #[error("配置不合法：{message}")]
+    InvalidConfig { message: String },
+
+    #[error("HTTP 状态错误 [{provider}]：status={status}，body={body}")]
+    HttpStatus {
+        provider: String,
+        status: u16,
+        body: String,
+    },
+
+    #[error("Provider 响应错误 [{provider}]：code={code:?}，message={message}")]
+    ProviderResponse {
+        provider: String,
+        code: Option<String>,
         message: String,
-        /// 产生错误的 Provider 名称。
-        provider: String,
     },
 
-    /// 鉴权失败。
-    ///
-    /// 该错误通常对应 HTTP `401 Unauthorized`，表示 API Key 无效、缺失或已过期。
-    #[error("鉴权失败，请检查 API Key 是否正确或是否已过期")]
-    AuthError,
+    #[error("认证错误：{message}")]
+    Authentication { message: String },
 
-    /// 触发了 Provider 的速率限制。
-    ///
-    /// 当返回 `429 Too Many Requests` 时，SDK 可以尝试从响应头中提取建议重试时间。
-    #[error("请求频率超限，请稍后重试")]
-    RateLimitError {
-        /// 建议的重试等待时间。
-        retry_after: Option<Duration>,
+    #[error("触发限流：retry_after={retry_after_secs:?}s")]
+    RateLimit { retry_after_secs: Option<u64> },
+
+    #[error("请求超时（{stage}，{timeout_ms}ms）：{message}")]
+    RequestTimeout {
+        stage: &'static str,
+        timeout_ms: u64,
+        message: String,
     },
 
-    /// 发送 HTTP 请求或接收响应时出现网络错误。
-    #[error("网络请求失败：{0}")]
-    NetworkError(#[from] reqwest::Error),
-
-    /// 解析 JSON 数据时发生错误。
-    #[error("解析响应数据失败：{0}")]
-    ParseError(#[from] serde_json::Error),
-
-    /// 处理流式响应时发生错误。
-    #[error("处理流式响应失败：{0}")]
-    StreamError(String),
-
-    /// 本地构建请求或输入校验失败。
-    #[error("参数校验失败：{0}")]
-    ValidationError(String),
-
-    /// 当前 Provider 不支持调用方请求的能力。
-    #[error("Provider {provider} 不支持功能：{feature}")]
-    UnsupportedFeature {
-        /// Provider 名称。
-        provider: String,
-        /// 不支持的功能名称。
-        feature: String,
+    #[error("网络传输错误（{stage}）：{message}；底层错误：{source}")]
+    Transport {
+        stage: &'static str,
+        message: String,
+        #[source]
+        source: reqwest::Error,
     },
+
+    #[error("JSON 编解码错误：{0}")]
+    JsonCodec(#[from] serde_json::Error),
+
+    #[error("流式协议错误 [{provider}]：{message}")]
+    StreamProtocol { provider: String, message: String },
+
+    #[error("工具协议错误：{message}")]
+    ToolProtocol { message: String },
+
+    #[error("Provider [{provider:?}] 不支持该能力：{capability}")]
+    UnsupportedCapability {
+        provider: Option<String>,
+        capability: String,
+    },
+
+    #[error("多模态输入错误：{message}")]
+    MediaInput { message: String },
+}
+
+impl LlmError {
+    pub(crate) fn request_timeout(
+        stage: &'static str,
+        timeout_ms: u64,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::RequestTimeout {
+            stage,
+            timeout_ms,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn transport(stage: &'static str, source: reqwest::Error) -> Self {
+        let message = if source.is_connect() {
+            "无法建立连接，请检查 base_url、网络连通性、代理或 TLS 配置".into()
+        } else if source.is_timeout() {
+            "请求在超时窗口内未完成，请检查网络状况或适当调大超时配置".into()
+        } else if source.is_decode() {
+            "响应体读取或解码失败，请检查 provider 是否返回了预期格式的数据".into()
+        } else if source.is_body() {
+            "响应体读取失败，连接可能已被服务端中断或网络不稳定".into()
+        } else if source.is_request() {
+            "请求构造或发送失败，请检查 URL、请求体和底层 HTTP 配置".into()
+        } else {
+            "底层 HTTP 传输失败".into()
+        };
+
+        Self::Transport {
+            stage,
+            message,
+            source,
+        }
+    }
+}
+
+impl From<reqwest::Error> for LlmError {
+    fn from(source: reqwest::Error) -> Self {
+        Self::transport("处理 HTTP 响应", source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlmError;
+
+    #[test]
+    fn request_timeout_keeps_stage_and_message() {
+        let error = LlmError::request_timeout("读取流式响应", 60_000, "60 秒内未收到新数据");
+
+        assert!(matches!(
+            error,
+            LlmError::RequestTimeout {
+                stage,
+                timeout_ms: 60_000,
+                ref message,
+            } if stage == "读取流式响应" && message == "60 秒内未收到新数据"
+        ));
+    }
 }

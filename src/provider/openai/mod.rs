@@ -1,156 +1,240 @@
-//! OpenAI 适配器。
-//!
-//! 组合 OpenAI 协议下的请求构建、响应解析与流式解析能力。
-
-use std::sync::Mutex;
-
-use serde_json::Value;
-
-use crate::{
-    ChatResponse, LlmError, Message, Provider, ProviderAdapter, StreamChunk, Tool,
-    provider::ThinkingCapability,
-    types::RequestOptions,
-};
-
-pub(crate) mod request;
-pub(crate) mod response;
+mod audio;
+mod chat;
+mod embedding;
+mod image;
+mod media;
 mod stream;
 
-pub use stream::OpenAiStreamParser;
+#[cfg(test)]
+mod tests;
 
-/// `OpenAI` 协议适配器。
-#[derive(Debug, Default)]
-pub struct OpenAiAdapter {
-    stream_parser: Mutex<OpenAiStreamParser>,
+/// OpenAI Chat Completions 接口路径。
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+
+use std::pin::Pin;
+
+use async_trait::async_trait;
+use futures::Stream;
+
+use crate::{
+    error::LlmError,
+    middleware::Transport,
+    types::{
+        request::{
+            ChatRequest, EmbeddingRequest, ImageGenRequest, SpeechToTextRequest,
+            TextToSpeechRequest, VideoGenRequest,
+        },
+        response::{
+            ChatChunk, ChatResponse, EmbeddingResponse, FinishReason, ImageGenResponse,
+            SpeechToTextResponse, TextToSpeechResponse, Usage, VideoGenResponse,
+        },
+    },
+};
+
+use super::ProviderAdapter;
+
+pub(super) type ChatChunkStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>;
+
+/// OpenAI 兼容协议的适配器实现。
+pub(crate) struct OpenAiAdapter {
+    transport: Transport,
+    api_key: String,
+    base_url: String,
+    provider_name: &'static str,
 }
 
 impl OpenAiAdapter {
-    /// 创建 `OpenAI` 协议适配器。
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    fn new(
+        provider_name: &'static str,
+        api_key: &str,
+        base_url: &str,
+        transport: Transport,
+    ) -> Self {
+        Self {
+            transport,
+            api_key: api_key.to_owned(),
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            provider_name,
+        }
     }
 
-    fn lock_stream_parser(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, OpenAiStreamParser>, LlmError> {
-        self.stream_parser.lock().map_err(|_| {
-            LlmError::StreamError("OpenAI 流式解析器状态已损坏，无法继续解析".to_string())
+    fn name(&self) -> &'static str {
+        self.provider_name
+    }
+
+    fn request_json(&self, path: &str) -> reqwest::RequestBuilder {
+        self.transport
+            .client()
+            .post(format!("{}/{}", self.base_url, path.trim_start_matches('/')))
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+    }
+
+    fn request_multipart(&self, path: &str) -> reqwest::RequestBuilder {
+        self.transport
+            .client()
+            .post(format!("{}/{}", self.base_url, path.trim_start_matches('/')))
+            .bearer_auth(&self.api_key)
+    }
+
+    fn map_error_response(&self, status: u16, body_text: &str) -> LlmError {
+        match status {
+            401 | 403 => LlmError::Authentication {
+                message: format!("[{}] {}", self.name(), body_text),
+            },
+            429 => LlmError::RateLimit {
+                retry_after_secs: None,
+            },
+            _ => LlmError::HttpStatus {
+                provider: self.name().into(),
+                status,
+                body: body_text.to_owned(),
+            },
+        }
+    }
+
+    fn parse_finish_reason(raw: Option<&str>) -> Option<FinishReason> {
+        match raw {
+            Some("stop") => Some(FinishReason::Stop),
+            Some("length") => Some(FinishReason::Length),
+            Some("tool_calls") => Some(FinishReason::ToolCalls),
+            Some("content_filter") => Some(FinishReason::ContentFilter),
+            Some(_) => Some(FinishReason::Other),
+            None => None,
+        }
+    }
+
+    fn parse_usage(raw: Option<&serde_json::Value>) -> Option<Usage> {
+        let raw = raw?;
+        Some(Usage {
+            prompt_tokens: Self::parse_usage_tokens(raw.get("prompt_tokens"))?,
+            completion_tokens: Self::parse_usage_tokens(raw.get("completion_tokens"))?,
+            total_tokens: Self::parse_usage_tokens(raw.get("total_tokens"))?,
         })
     }
-}
 
-impl ProviderAdapter for OpenAiAdapter {
-    fn provider(&self) -> Provider {
-        Provider::OpenAI
+    fn parse_usage_tokens(raw: Option<&serde_json::Value>) -> Option<u32> {
+        raw?.as_u64()?.try_into().ok()
     }
 
-    fn thinking_capability(&self, model: &str) -> ThinkingCapability {
-        if is_reasoning_model(model) {
-            ThinkingCapability {
-                supports_thinking: true,
-                supports_thinking_budget: false,
-                supports_reasoning_effort: true,
-            }
+    fn stream_read_timeout_error(read_timeout_ms: u64) -> LlmError {
+        LlmError::request_timeout(
+            "读取流式响应",
+            read_timeout_ms,
+            "流式连接已建立，但在读取超时窗口内未收到新数据；可尝试增大 read_timeout_secs，或检查 provider 是否持续输出分片",
+        )
+    }
+
+    fn map_stream_read_error(read_timeout_ms: u64, err: reqwest::Error) -> LlmError {
+        if err.is_timeout() {
+            Self::stream_read_timeout_error(read_timeout_ms)
         } else {
-            ThinkingCapability::default()
+            LlmError::transport("读取流式响应", err)
         }
     }
+}
 
-    fn chat_path(&self) -> &'static str {
-        "/chat/completions"
+#[async_trait]
+impl ProviderAdapter for OpenAiAdapter {
+    fn name(&self) -> &'static str {
+        self.provider_name
     }
 
-    fn build_chat_request(
+    async fn chat(&self, model: &str, req: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.execute_chat(model, req).await
+    }
+
+    async fn chat_stream(
         &self,
         model: &str,
-        messages: &[Message],
-        tools: Option<&[Tool]>,
-        stream: bool,
-        options: &RequestOptions,
-    ) -> Result<Value, LlmError> {
-        if stream {
-            self.lock_stream_parser()?.reset();
-        }
-
-        request::build_chat_request(model, messages, tools, stream, options)
+        req: ChatRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>, LlmError> {
+        self.execute_chat_stream(model, req).await
     }
 
-    fn parse_chat_response(&self, body: &[u8]) -> Result<ChatResponse, LlmError> {
-        response::parse_chat_response(body)
+    async fn embed(
+        &self,
+        model: &str,
+        req: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, LlmError> {
+        self.execute_embed(model, req).await
     }
 
-    fn parse_stream_chunk(&self, event_data: &str) -> Result<Option<StreamChunk>, LlmError> {
-        self.lock_stream_parser()?.parse_event(event_data)
+    async fn speech_to_text(
+        &self,
+        model: &str,
+        req: SpeechToTextRequest,
+    ) -> Result<SpeechToTextResponse, LlmError> {
+        self.execute_speech_to_text(model, req).await
     }
 
-    fn parse_stream_chunks(&self, event_data: &str) -> Result<Vec<StreamChunk>, LlmError> {
-        self.lock_stream_parser()?.parse_event_chunks(event_data)
+    async fn text_to_speech(
+        &self,
+        model: &str,
+        req: TextToSpeechRequest,
+    ) -> Result<TextToSpeechResponse, LlmError> {
+        self.execute_text_to_speech(model, req).await
+    }
+
+    async fn generate_image(
+        &self,
+        model: &str,
+        req: ImageGenRequest,
+    ) -> Result<ImageGenResponse, LlmError> {
+        self.execute_generate_image(model, req).await
+    }
+
+    async fn generate_video(
+        &self,
+        model: &str,
+        req: VideoGenRequest,
+    ) -> Result<VideoGenResponse, LlmError> {
+        self.execute_generate_video(model, req).await
     }
 }
 
-fn is_reasoning_model(model: &str) -> bool {
-    model.starts_with("o1") || model.starts_with("o3")
+/// 构造 OpenAI 兼容 provider adapter。
+pub(crate) fn build(
+    provider_name: &'static str,
+    api_key: &str,
+    base_url: &str,
+    transport: &Transport,
+) -> Result<Box<dyn ProviderAdapter>, LlmError> {
+    Ok(Box::new(OpenAiAdapter::new(
+        provider_name,
+        api_key,
+        base_url,
+        transport.clone(),
+    )))
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
+mod unit_tests {
     use super::OpenAiAdapter;
-    use crate::{Message, Provider, ProviderAdapter, types::RequestOptions};
 
     #[test]
-    fn adapter_exposes_openai_provider_info() {
-        let adapter = OpenAiAdapter::new();
+    fn parse_usage_accepts_u32_range_values() {
+        let usage = OpenAiAdapter::parse_usage(Some(&serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+            })))
+        .unwrap();
 
-        assert_eq!(adapter.provider(), Provider::OpenAI);
-        assert_eq!(adapter.chat_path(), "/chat/completions");
-        assert_eq!(
-            adapter.default_base_url(),
-            Some("https://api.openai.com/v1")
-        );
-        assert!(adapter.thinking_capability("o3-mini").supports_thinking);
-        assert!(
-            adapter
-                .thinking_capability("o3-mini")
-                .supports_reasoning_effort
-        );
-        assert!(!adapter.thinking_capability("gpt-4o").supports_thinking);
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 30);
     }
 
     #[test]
-    fn adapter() {
-        let adapter = OpenAiAdapter::new();
-        let request = adapter
-            .build_chat_request(
-                "gpt-4o",
-                &[Message::user("你好")],
-                None,
-                true,
-                &RequestOptions::default(),
-            )
-            .expect("请求体应构建成功");
-
-        assert_eq!(request["stream"], true);
-
-        let chunk = adapter
-            .parse_stream_chunk(
-                &json!({
-                    "choices": [
-                        {
-                            "delta": {
-                                "content": "你"
-                            },
-                            "finish_reason": null
-                        }
-                    ]
-                })
-                .to_string(),
-            )
-            .expect("流式事件应解析成功")
-            .expect("应产出流式增量");
-
-        assert_eq!(chunk.delta, "你");
+    fn parse_usage_rejects_values_larger_than_u32() {
+        assert!(
+            OpenAiAdapter::parse_usage(Some(&serde_json::json!({
+                "prompt_tokens": u64::from(u32::MAX) + 1,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+            })))
+            .is_none()
+        );
     }
 }

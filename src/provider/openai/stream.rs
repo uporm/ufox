@@ -1,465 +1,436 @@
-//! `OpenAI` 流式解析。
-//!
-//! 解析单条 `SSE` 事件并转换为公共 `StreamChunk`。
+use std::{
+    collections::{BTreeMap, VecDeque},
+    pin::Pin,
+};
 
-use serde::Deserialize;
+use futures::{stream, Stream, StreamExt};
 
-use crate::{FinishReason, LlmError, StreamChunk, ToolCall, Usage};
+use crate::{
+    error::LlmError,
+    types::{
+        content::ToolCall,
+        request::ChatRequest,
+        response::{ChatChunk, FinishReason},
+    },
+};
 
-/// `OpenAI` 流式事件解析器。
-#[derive(Debug, Default)]
-pub struct OpenAiStreamParser {
-    pending_tool_calls: Vec<PartialToolCall>,
+use super::{ChatChunkStream, OpenAiAdapter, CHAT_COMPLETIONS_PATH};
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    tool_name: Option<String>,
+    arguments: String,
+    arguments_seen: bool,
 }
 
-impl OpenAiStreamParser {
-    /// 创建流式事件解析器。
+impl PartialToolCall {
+    fn finalize(self) -> Result<ToolCall, LlmError> {
+        let id = self.id.ok_or_else(|| LlmError::ToolProtocol {
+            message: "stream tool call 缺少 id".into(),
+        })?;
+        let tool_name = self.tool_name.ok_or_else(|| LlmError::ToolProtocol {
+            message: "stream tool call 缺少 name".into(),
+        })?;
+        let arguments_raw = if self.arguments_seen {
+            self.arguments.as_str()
+        } else {
+            return Err(LlmError::ToolProtocol {
+                message: "stream tool call 缺少 arguments".into(),
+            });
+        };
+        let arguments = serde_json::from_str(arguments_raw).map_err(|err| LlmError::ToolProtocol {
+            message: format!("stream tool arguments 解析失败: {err}"),
+        })?;
 
-    pub fn new() -> Self {
-        Self::default()
+        Ok(ToolCall {
+            id,
+            tool_name,
+            arguments,
+        })
+    }
+}
+
+struct StreamState {
+    source: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    buffer: Vec<u8>,
+    pending: VecDeque<Result<ChatChunk, LlmError>>,
+    tool_calls: BTreeMap<usize, PartialToolCall>,
+    done: bool,
+}
+
+impl OpenAiAdapter {
+    fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+        for index in 0..buffer.len() {
+            if buffer[index..].starts_with(b"\r\n\r\n") {
+                return Some(buffer.drain(..index + 4).collect());
+            }
+            if buffer[index..].starts_with(b"\n\n") {
+                return Some(buffer.drain(..index + 2).collect());
+            }
+        }
+        None
     }
 
-    /// 重置内部状态。
-    pub fn reset(&mut self) {
-        self.pending_tool_calls.clear();
+    fn parse_sse_data(event: &[u8], provider_name: &str) -> Result<Option<String>, LlmError> {
+        let raw = String::from_utf8(event.to_vec()).map_err(|err| LlmError::StreamProtocol {
+            provider: provider_name.to_owned(),
+            message: format!("SSE 数据不是合法 UTF-8: {err}"),
+        })?;
+        let mut data_lines = Vec::new();
+        for line in raw.replace("\r\n", "\n").lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                data_lines.push(data.trim_start().to_owned());
+            }
+        }
+        if data_lines.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(data_lines.join("\n")))
     }
 
-    /// 解析单条 `SSE` 事件的 `data:` 文本。
-    /// # Errors
-    /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
-    /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
-    pub fn parse_event(&mut self, event_data: &str) -> Result<Option<StreamChunk>, LlmError> {
-        Ok(self.parse_event_chunks(event_data)?.into_iter().last())
+    fn drain_partial_tool_calls(
+        partials: &mut BTreeMap<usize, PartialToolCall>,
+    ) -> Result<Vec<ToolCall>, LlmError> {
+        let mut calls = Vec::with_capacity(partials.len());
+        for (_, partial) in std::mem::take(partials) {
+            calls.push(partial.finalize()?);
+        }
+        Ok(calls)
     }
 
-    /// 解析单条 `SSE` 事件并返回其中全部片段。
-    /// # Errors
-    /// - [`LlmError::ParseError`]：当事件数据不是合法 `JSON` 时触发
-    /// - [`LlmError::StreamError`]：当事件缺少必要字段或工具调用碎片不完整时触发
-    pub fn parse_event_chunks(&mut self, event_data: &str) -> Result<Vec<StreamChunk>, LlmError> {
-        if is_done_event(event_data) {
-            self.reset();
-            return Ok(Vec::new());
-        }
-
-        let response: OpenAiStreamResponse = serde_json::from_str(event_data)?;
-
-        if response.choices.is_empty() {
-            return Ok(response
-                .usage
-                .map(|usage| {
-                    vec![
-                        StreamChunk::new("")
-                            .with_usage(Usage::new(usage.prompt_tokens, usage.completion_tokens)),
-                    ]
-                })
-                .unwrap_or_default());
-        }
-
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::StreamError("OpenAI 流式事件缺少 choices".to_string()))?;
-
-        let reasoning_delta = choice.delta.reasoning_content.unwrap_or_default();
-        let delta_text = choice.delta.content.into_text();
-
-        if let Some(tool_calls) = choice.delta.tool_calls {
-            self.merge_tool_call_deltas(tool_calls);
-        }
+    fn parse_stream_event(
+        provider_name: &str,
+        raw: &serde_json::Value,
+        partials: &mut BTreeMap<usize, PartialToolCall>,
+    ) -> Result<Vec<ChatChunk>, LlmError> {
+        let choice = raw
+            .get("choices")
+            .and_then(|value| value.as_array())
+            .and_then(|choices| choices.first())
+            .ok_or_else(|| LlmError::StreamProtocol {
+                provider: provider_name.to_owned(),
+                message: "缺少 choices[0]".into(),
+            })?;
 
         let mut chunks = Vec::new();
-        if !reasoning_delta.is_empty() {
-            chunks.push(StreamChunk::thinking(reasoning_delta));
-        }
-        if !delta_text.is_empty() {
-            chunks.push(StreamChunk::new(delta_text));
-        }
-
-        let mut has_effective_data = chunks.iter().any(|chunk| !chunk.delta.is_empty());
-        if chunks.is_empty() {
-            chunks.push(StreamChunk::new(""));
-        }
-
-        if let Some(finish_reason) = choice.finish_reason.map(FinishReason::from) {
-            if finish_reason.is_tool_calls() {
-                let tool_calls = self.take_completed_tool_calls()?;
-                if !tool_calls.is_empty() {
-                    let chunk = chunks
-                        .last_mut()
-                        .expect("chunks 在附加工具调用前一定至少有一个元素");
-                    *chunk = chunk.clone().with_tool_calls(tool_calls);
-                }
-            }
-
-            let chunk = chunks
-                .last_mut()
-                .expect("chunks 在附加结束原因前一定至少有一个元素");
-            *chunk = chunk.clone().with_finish_reason(finish_reason);
-            has_effective_data = true;
-        }
-
-        if let Some(usage) = response
-            .usage
-            .map(|usage| Usage::new(usage.prompt_tokens, usage.completion_tokens))
+        let delta = choice.get("delta").and_then(|value| value.as_object());
+        if let Some(content) = delta
+            .and_then(|value| value.get("content"))
+            .and_then(|value| value.as_str())
+            .filter(|content| !content.is_empty())
         {
-            let chunk = chunks
-                .last_mut()
-                .expect("chunks 在附加 usage 前一定至少有一个元素");
-            *chunk = chunk.clone().with_usage(usage);
-            has_effective_data = true;
+            chunks.push(ChatChunk {
+                text_delta: Some(content.to_owned()),
+                ..ChatChunk::default()
+            });
         }
 
-        if has_effective_data {
-            Ok(chunks)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    fn merge_tool_call_deltas(&mut self, deltas: Vec<OpenAiToolCallDelta>) {
-        for delta in deltas {
-            let index = delta.index;
-            while self.pending_tool_calls.len() <= index {
-                self.pending_tool_calls.push(PartialToolCall::default());
-            }
-
-            let entry = &mut self.pending_tool_calls[index];
-            if let Some(id) = delta.id {
-                entry.id.push_str(&id);
-            }
-
-            if let Some(function) = delta.function {
-                if let Some(name) = function.name {
-                    entry.name.push_str(&name);
+        if let Some(items) = delta
+            .and_then(|value| value.get("tool_calls"))
+            .and_then(|value| value.as_array())
+        {
+            for item in items {
+                let index = item
+                    .get("index")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| LlmError::ToolProtocol {
+                        message: "stream tool call 缺少 index".into(),
+                    })? as usize;
+                let entry = partials.entry(index).or_default();
+                if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                    entry.id = Some(id.to_owned());
                 }
-
-                if let Some(arguments) = function.arguments {
-                    entry.arguments.push_str(&arguments);
+                if let Some(function) = item.get("function").and_then(|value| value.as_object()) {
+                    if let Some(name) = function.get("name").and_then(|value| value.as_str()) {
+                        match &mut entry.tool_name {
+                            Some(existing) => existing.push_str(name),
+                            None => entry.tool_name = Some(name.to_owned()),
+                        }
+                    }
+                    if let Some(arguments) = function.get("arguments") {
+                        let arguments = arguments.as_str().ok_or_else(|| LlmError::ToolProtocol {
+                            message: "stream tool call arguments 不是字符串".into(),
+                        })?;
+                        entry.arguments_seen = true;
+                        entry.arguments.push_str(arguments);
+                    }
                 }
             }
         }
-    }
 
-    fn take_completed_tool_calls(&mut self) -> Result<Vec<ToolCall>, LlmError> {
-        let pending = std::mem::take(&mut self.pending_tool_calls);
-        pending
-            .into_iter()
-            .enumerate()
-            .map(|(index, partial)| {
-                if partial.id.is_empty() || partial.name.is_empty() {
-                    return Err(LlmError::StreamError(format!(
-                        "OpenAI 工具调用流式片段不完整：索引 {index} 缺少 id 或 name"
-                    )));
+        let finish_reason =
+            Self::parse_finish_reason(choice.get("finish_reason").and_then(|value| value.as_str()));
+        let usage = Self::parse_usage(raw.get("usage"));
+
+        if matches!(finish_reason, Some(FinishReason::ToolCalls)) {
+            chunks.push(ChatChunk {
+                tool_calls: Self::drain_partial_tool_calls(partials)?,
+                finish_reason,
+                usage,
+                ..ChatChunk::default()
+            });
+        } else if finish_reason.is_some() || usage.is_some() {
+            if let Some(last) = chunks.last_mut() {
+                if last.finish_reason.is_none() && last.usage.is_none() {
+                    last.finish_reason = finish_reason;
+                    last.usage = usage;
+                } else {
+                    chunks.push(ChatChunk {
+                        finish_reason,
+                        usage,
+                        ..ChatChunk::default()
+                    });
                 }
-
-                Ok(ToolCall::new(partial.id, partial.name, partial.arguments))
-            })
-            .collect()
-    }
-}
-
-/// 判断事件是否为 `OpenAI` 的 `[DONE]` 终止标记。
-pub fn is_done_event(event_data: &str) -> bool {
-    event_data.trim() == "[DONE]"
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiStreamResponse {
-    #[serde(default)]
-    choices: Vec<OpenAiStreamChoice>,
-    #[serde(default)]
-    usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiStreamChoice {
-    #[serde(default)]
-    delta: OpenAiDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct OpenAiDelta {
-    #[serde(default)]
-    content: OpenAiDeltaContent,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(untagged)]
-enum OpenAiDeltaContent {
-    Text(String),
-    Parts(Vec<OpenAiDeltaContentPart>),
-    #[default]
-    Empty,
-}
-
-impl OpenAiDeltaContent {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text(text) => text,
-            Self::Parts(parts) => parts
-                .into_iter()
-                .map(OpenAiDeltaContentPart::into_text)
-                .collect::<String>(),
-            Self::Empty => String::new(),
+            } else {
+                chunks.push(ChatChunk {
+                    finish_reason,
+                    usage,
+                    ..ChatChunk::default()
+                });
+            }
         }
+
+        Ok(chunks)
     }
-}
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAiDeltaContentPart {
-    Text {
-        text: String,
-    },
-    Refusal {
-        refusal: String,
-    },
-    #[serde(other)]
-    Unsupported,
-}
+    pub(super) async fn execute_chat_stream(
+        &self,
+        model: &str,
+        req: ChatRequest,
+    ) -> Result<ChatChunkStream, LlmError> {
+        let body = self.to_request_body(model, &req, true).await?;
+        let response = self
+            .transport
+            .send(self.request_json(CHAT_COMPLETIONS_PATH).json(&body))
+            .await?;
 
-impl OpenAiDeltaContentPart {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text { text } => text,
-            Self::Refusal { refusal } => refusal,
-            Self::Unsupported => String::new(),
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body_text = response.text().await?;
+            return Err(self.map_error_response(status, &body_text));
         }
+
+        let provider_name = self.name();
+        let read_timeout_ms = self.transport.read_timeout_ms();
+        let stream = stream::unfold(
+            StreamState {
+                source: Box::pin(response.bytes_stream()),
+                buffer: Vec::new(),
+                pending: VecDeque::new(),
+                tool_calls: BTreeMap::new(),
+                done: false,
+            },
+            move |mut state| async move {
+                loop {
+                    if let Some(item) = state.pending.pop_front() {
+                        return Some((item, state));
+                    }
+                    if state.done {
+                        return None;
+                    }
+
+                    match state.source.next().await {
+                        Some(Ok(bytes)) => {
+                            state.buffer.extend_from_slice(&bytes);
+                            while let Some(event) = OpenAiAdapter::take_sse_event(&mut state.buffer) {
+                                match OpenAiAdapter::parse_sse_data(&event, provider_name) {
+                                    Ok(Some(data)) if data == "[DONE]" => {
+                                        state.done = true;
+                                        match OpenAiAdapter::drain_partial_tool_calls(
+                                            &mut state.tool_calls,
+                                        ) {
+                                            Ok(tool_calls) if !tool_calls.is_empty() => {
+                                                state.pending.push_back(Ok(ChatChunk {
+                                                    tool_calls,
+                                                    ..ChatChunk::default()
+                                                }));
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => state.pending.push_back(Err(err)),
+                                        }
+                                        break;
+                                    }
+                                    Ok(Some(data)) => {
+                                        match serde_json::from_str::<serde_json::Value>(&data) {
+                                            Ok(raw) => match OpenAiAdapter::parse_stream_event(
+                                                provider_name,
+                                                &raw,
+                                                &mut state.tool_calls,
+                                            ) {
+                                                Ok(chunks) => {
+                                                    state.pending.extend(chunks.into_iter().map(Ok));
+                                                }
+                                                Err(err) => {
+                                                    state.done = true;
+                                                    state.pending.push_back(Err(err));
+                                                    break;
+                                                }
+                                            },
+                                            Err(err) => {
+                                                state.done = true;
+                                                state.pending.push_back(Err(
+                                                    LlmError::StreamProtocol {
+                                                        provider: provider_name.to_owned(),
+                                                        message: format!(
+                                                            "stream json 解析失败: {err}"
+                                                        ),
+                                                    },
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        state.done = true;
+                                        state.pending.push_back(Err(err));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(err)) => {
+                            state.done = true;
+                            return Some((
+                                Err(OpenAiAdapter::map_stream_read_error(read_timeout_ms, err)),
+                                state,
+                            ));
+                        }
+                        None => {
+                            state.done = true;
+                            match OpenAiAdapter::drain_partial_tool_calls(&mut state.tool_calls) {
+                                Ok(tool_calls) if !tool_calls.is_empty() => {
+                                    return Some((
+                                        Ok(ChatChunk {
+                                            tool_calls,
+                                            ..ChatChunk::default()
+                                        }),
+                                        state,
+                                    ));
+                                }
+                                Ok(_) => return None,
+                                Err(err) => return Some((Err(err), state)),
+                            }
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(Box::pin(stream))
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiToolCallDelta {
-    index: usize,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<OpenAiToolFunctionDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiToolFunctionDelta {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-}
-
-#[derive(Debug, Default)]
-struct PartialToolCall {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::BTreeMap;
 
-    use super::{OpenAiStreamParser, is_done_event};
-    use crate::FinishReason;
+    use crate::{error::LlmError, types::response::FinishReason};
+
+    use super::{OpenAiAdapter, PartialToolCall};
 
     #[test]
-    fn done_chunk() {
-        let mut parser = OpenAiStreamParser::new();
+    fn partial_tool_call_rejects_missing_arguments() {
+        let error = PartialToolCall {
+            id: Some("call_1".into()),
+            tool_name: Some("get_weather".into()),
+            arguments: String::new(),
+            arguments_seen: false,
+        }
+        .finalize()
+        .unwrap_err();
 
-        let chunk = parser.parse_event("[DONE]").expect("事件应解析成功");
-
-        assert!(chunk.is_none());
-        assert!(is_done_event("[DONE]"));
+        assert!(matches!(
+            error,
+            LlmError::ToolProtocol { ref message } if message == "stream tool call 缺少 arguments"
+        ));
     }
 
     #[test]
-    fn stream_test() {
-        let body = json!({
-            "choices": [
-                {
+    fn parse_stream_event_rejects_non_string_arguments() {
+        let error = OpenAiAdapter::parse_stream_event(
+            "compatible",
+            &serde_json::json!({
+                "choices": [{
                     "delta": {
-                        "content": "你"
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": { "city": "Hangzhou" }
+                            }
+                        }]
                     },
                     "finish_reason": null
-                }
-            ]
-        })
-        .to_string();
-        let mut parser = OpenAiStreamParser::new();
+                }]
+            }),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
 
-        let chunk = parser
-            .parse_event(&body)
-            .expect("事件应解析成功")
-            .expect("应产出增量");
-
-        assert_eq!(chunk.delta, "你");
-        assert!(!chunk.is_terminal());
+        assert!(matches!(
+            error,
+            LlmError::ToolProtocol { ref message }
+                if message == "stream tool call arguments 不是字符串"
+        ));
     }
 
     #[test]
-    fn stream_test_2() {
-        let mut parser = OpenAiStreamParser::new();
-        let first = json!({
-            "choices": [
-                {
+    fn parse_stream_event_finishes_with_missing_arguments_error() {
+        let error = OpenAiAdapter::parse_stream_event(
+            "compatible",
+            &serde_json::json!({
+                "choices": [{
                     "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "call_1",
-                                "function": {
-                                    "name": "get_weather",
-                                    "arguments": "{\"city\":"
-                                }
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather"
                             }
-                        ]
-                    },
-                    "finish_reason": null
-                }
-            ]
-        })
-        .to_string();
-        let second = json!({
-            "choices": [
-                {
-                    "delta": {
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "function": {
-                                    "arguments": "\"杭州\"}"
-                                }
-                            }
-                        ]
+                        }]
                     },
                     "finish_reason": "tool_calls"
-                }
-            ]
-        })
-        .to_string();
+                }]
+            }),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
 
-        assert!(
-            parser
-                .parse_event(&first)
-                .expect("第一段应解析成功")
-                .is_none()
-        );
-
-        let chunk = parser
-            .parse_event(&second)
-            .expect("第二段应解析成功")
-            .expect("应输出完整工具调用");
-
-        assert_eq!(chunk.finish_reason.as_ref(), Some(&FinishReason::ToolCalls));
-        assert_eq!(
-            chunk.tool_calls.as_ref().expect("应包含工具调用")[0].arguments,
-            "{\"city\":\"杭州\"}"
-        );
+        assert!(matches!(
+            error,
+            LlmError::ToolProtocol { ref message }
+                if message == "stream tool call 缺少 arguments"
+        ));
     }
 
     #[test]
-    fn usage() {
-        let body = json!({
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 8,
-                "total_tokens": 20
-            }
-        })
-        .to_string();
-        let mut parser = OpenAiStreamParser::new();
-
-        let chunk = parser
-            .parse_event(&body)
-            .expect("事件应解析成功")
-            .expect("应产出 usage 尾片段");
-
-        assert_eq!(chunk.usage.as_ref().expect("应包含 usage").total, 20);
-    }
-
-    #[test]
-    fn reasoning_content() {
-        let body = json!({
-            "choices": [
-                {
+    fn parse_stream_event_keeps_finish_reason_for_valid_tool_call() {
+        let chunks = OpenAiAdapter::parse_stream_event(
+            "compatible",
+            &serde_json::json!({
+                "choices": [{
                     "delta": {
-                        "reasoning_content": "先分析"
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"Hangzhou\"}"
+                            }
+                        }]
                     },
-                    "finish_reason": null
-                }
-            ]
-        })
-        .to_string();
-        let mut parser = OpenAiStreamParser::new();
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+            &mut BTreeMap::new(),
+        )
+        .unwrap();
 
-        let chunk = parser
-            .parse_event(&body)
-            .expect("事件应解析成功")
-            .expect("应产出思考增量");
-
-        assert!(chunk.is_thinking());
-        assert_eq!(chunk.delta, "先分析");
-    }
-
-    #[test]
-    fn stream_test_3() {
-        let body = json!({
-            "choices": [
-                {
-                    "delta": {
-                        "reasoning_content": "先分析",
-                        "content": "最终答案"
-                    },
-                    "finish_reason": null
-                }
-            ]
-        })
-        .to_string();
-        let mut parser = OpenAiStreamParser::new();
-
-        let chunks = parser.parse_event_chunks(&body).expect("事件应解析成功");
-
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].is_thinking());
-        assert_eq!(chunks[0].delta, "先分析");
-        assert_eq!(chunks[1].delta, "最终答案");
-        assert!(!chunks[1].is_thinking());
-    }
-
-    #[test]
-    fn parse_event_2() {
-        let body = json!({
-            "choices": [
-                {
-                    "delta": {
-                        "reasoning_content": "先分析",
-                        "content": "最终答案"
-                    },
-                    "finish_reason": null
-                }
-            ]
-        })
-        .to_string();
-        let mut parser = OpenAiStreamParser::new();
-
-        let chunk = parser
-            .parse_event(&body)
-            .expect("事件应解析成功")
-            .expect("应返回最后片段");
-
-        assert!(!chunk.is_thinking());
-        assert_eq!(chunk.delta, "最终答案");
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0].finish_reason, Some(FinishReason::ToolCalls)));
+        assert_eq!(chunks[0].tool_calls.len(), 1);
     }
 }
