@@ -60,6 +60,14 @@ impl ProviderAdapter for QwenAdapter {
             .chat_stream(model, self.rewrite_chat_request(req))
             .await
     }
+
+    async fn embed(
+        &self,
+        model: &str,
+        req: crate::types::request::EmbeddingRequest,
+    ) -> Result<crate::types::response::EmbeddingResponse, LlmError> {
+        self.inner.embed(model, req).await
+    }
 }
 
 /// 构造通义千问 provider adapter。
@@ -82,7 +90,7 @@ mod tests {
     use crate::{
         middleware::{RetryConfig, Transport, TransportConfig},
         types::{
-            request::{ChatRequest, EmbeddingRequest},
+            request::ChatRequest,
             response::ChatResponse,
         },
     };
@@ -135,17 +143,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qwen_adapter_only_enables_chat_apis() {
+    async fn qwen_adapter_only_enables_supported_apis() {
         let adapter = build("test-key", "https://example.com/v1", &test_transport()).unwrap();
 
         assert_eq!(adapter.name(), "qwen");
         assert!(matches!(
             adapter
-                .embed(
-                    "text-embedding-v1",
-                    EmbeddingRequest {
-                        inputs: vec!["hello".into()],
-                        dimensions: None,
+                .speech_to_text(
+                    "qwen-audio",
+                    crate::types::request::SpeechToTextRequest {
+                        source: crate::types::content::MediaSource::Url {
+                            url: "https://example.com/audio.mp3".into()
+                        },
+                        format: crate::types::content::AudioFormat::Mp3,
+                        language: None,
                         extensions: serde_json::Map::new(),
                     },
                 )
@@ -154,7 +165,7 @@ mod tests {
             LlmError::UnsupportedCapability {
                 provider: Some(ref provider),
                 ref capability,
-            } if provider == "qwen" && capability == "embed"
+            } if provider == "qwen" && capability == "speech_to_text"
         ));
     }
 
@@ -168,6 +179,7 @@ mod tests {
                 "qwen-plus",
                 ChatRequest::builder()
                     .user_text("hello")
+                    .thinking(true)
                     .thinking_budget(2048)
                     .build(),
             )
