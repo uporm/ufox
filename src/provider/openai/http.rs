@@ -293,6 +293,35 @@ pub(super) fn parse_sse_data(
     Ok(Some(data_lines.join("\n")))
 }
 
+// ── SSE 状态机接口 ────────────────────────────────────────────────────────────
+
+/// SSE 流式状态机的公共接口，供两套 adapter 共用。
+///
+/// 通过此 trait 与具体状态机交互，消除 `chat_completions::stream`
+/// 与 `responses::stream` 中重复的事件分发循环。
+pub(super) trait SseState {
+    fn buffer_mut(&mut self) -> &mut Vec<u8>;
+    fn is_done(&self) -> bool;
+    fn abort(&mut self, err: LlmError);
+    fn handle_data(&mut self, provider_name: &str, data: &str) -> Result<(), LlmError>;
+}
+
+/// 扫描缓冲区中已完整到达的 SSE 事件，逐帧分发给 `state.handle_data`。
+pub(super) fn process_buffered_events<S: SseState>(provider_name: &str, state: &mut S) {
+    while let Some(event) = take_sse_event(state.buffer_mut()) {
+        let data = match parse_sse_data(&event, provider_name) {
+            Ok(Some(data)) => data,
+            Ok(None) => continue,
+            Err(err) => { state.abort(err); break; }
+        };
+        if let Err(err) = state.handle_data(provider_name, &data) {
+            state.abort(err);
+            break;
+        }
+        if state.is_done() { break; }
+    }
+}
+
 // ── 单元测试 ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

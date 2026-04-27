@@ -1,26 +1,16 @@
-use ufox_llm::{AudioFormat, Client, MediaSource, Provider, SpeechToTextRequest};
+use ufox_llm::{AudioFormat, Client, MediaSource, SpeechToTextRequest};
 
 #[tokio::main]
-async fn main() {
-    if let Err(err) = run().await {
-        eprintln!("speech_to_text 示例执行失败：{err}");
-        std::process::exit(1);
-    }
-}
-
-async fn run() -> Result<(), ufox_llm::LlmError> {
-    let client = Client::builder()
-        .provider(Provider::OpenAI)
-        .api_key("sk-xxx")
-        .model("gpt-4o-mini-transcribe")
-        .build()?;
+async fn main() -> Result<(), ufox_llm::LlmError> {
+    // 默认走环境变量，避免示例里硬编码密钥，也和其他示例保持一致。
+    let client = Client::from_env()?;
 
     let output = client
         .speech_to_text(SpeechToTextRequest {
             source: MediaSource::File {
-                path: "sample.wav".into(),
+                path: "examples/sample.mp3".into(),
             },
-            format: AudioFormat::Wav,
+            format: AudioFormat::Mp3,
             language: Some("zh".into()),
             extensions: Default::default(),
         })

@@ -30,8 +30,8 @@ use crate::{
 use super::super::{
     CHAT_COMPLETIONS_PATH, ChatChunkStream,
     http::{
-        OpenAiRequestBuilder, map_stream_read_error, parse_finish_reason, parse_sse_data,
-        parse_usage, send_request, take_sse_event,
+        OpenAiRequestBuilder, SseState, map_stream_read_error, parse_finish_reason,
+        parse_usage, process_buffered_events, send_request,
     },
 };
 use super::ChatCompletionsAdapter;
@@ -66,54 +66,38 @@ impl PartialToolCall {
         let tool_name = self.tool_name.ok_or_else(|| LlmError::ToolProtocol {
             message: "stream tool call 缺少 name".into(),
         })?;
-        let arguments_raw = if self.arguments_seen {
-            self.arguments.as_str()
-        } else {
+        if !self.arguments_seen {
             return Err(LlmError::ToolProtocol {
                 message: "stream tool call 缺少 arguments".into(),
             });
-        };
+        }
         let arguments =
-            serde_json::from_str(arguments_raw).map_err(|err| LlmError::ToolProtocol {
+            serde_json::from_str(&self.arguments).map_err(|err| LlmError::ToolProtocol {
                 message: format!("stream tool arguments 解析失败: {err}"),
             })?;
-
-        Ok(ToolCall {
-            id,
-            tool_name,
-            arguments,
-        })
+        Ok(ToolCall { id, tool_name, arguments })
     }
 }
 
 // ── StreamState —— unfold 状态容器 ───────────────────────────────────────────
 
 /// `stream::unfold` 的携带状态。
-///
-/// 字段说明：
-/// - `source` — 原始 HTTP 字节流
-/// - `buffer` — 字节缓冲，存放尚未凑成完整 SSE 帧的字节
-/// - `pending` — 已解析但尚未 yield 的 chunk 队列
-/// - `tool_calls` — 按索引存放的 [`PartialToolCall`]，key 为 delta 中的 `index`
-/// - `started_at` — 请求发起时间，用于日志计时
-/// - `first_chunk_logged` — 首个 chunk 延迟是否已记录
-/// - `done` — 是否已收到 `[DONE]` 或遇到不可恢复错误
 pub(super) struct StreamState {
     pub(super) source: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     pub(super) buffer: Vec<u8>,
     pub(super) pending: VecDeque<Result<ChatChunk, LlmError>>,
     pub(super) tool_calls: BTreeMap<usize, PartialToolCall>,
     pub(super) started_at: std::time::Instant,
-    pub(super) first_chunk_logged: bool,
+    pub(super) saw_first_chunk: bool,
     pub(super) done: bool,
 }
 
 impl StreamState {
-    /// 取出下一个待产出的 chunk，并在首次成功产出时记录状态。
+    /// 取出下一个待产出的 chunk，并在首次成功产出时标记。
     pub(super) fn pop_pending(&mut self) -> Option<Result<ChatChunk, LlmError>> {
         let item = self.pending.pop_front()?;
         if item.is_ok() {
-            self.first_chunk_logged = true;
+            self.saw_first_chunk = true;
         }
         Some(item)
     }
@@ -128,11 +112,22 @@ impl StreamState {
         if tool_calls.is_empty() {
             return;
         }
-
         self.pending.push_back(Ok(ChatChunk {
             tool_calls,
             ..ChatChunk::default()
         }));
+    }
+}
+
+impl SseState for StreamState {
+    fn buffer_mut(&mut self) -> &mut Vec<u8> { &mut self.buffer }
+    fn is_done(&self) -> bool { self.done }
+    fn abort(&mut self, err: LlmError) {
+        self.done = true;
+        self.pending.push_back(Err(err));
+    }
+    fn handle_data(&mut self, provider_name: &str, data: &str) -> Result<(), LlmError> {
+        ChatCompletionsAdapter::handle_stream_data(provider_name, data, self)
     }
 }
 
@@ -251,29 +246,16 @@ impl ChatCompletionsAdapter {
         chunks.push(Self::terminal_chunk(finish_reason, usage));
     }
 
-    /// 将尚未完成的 partial tool calls 最终化。
-    fn finalize_pending_tool_calls(
-        partials: &mut BTreeMap<usize, PartialToolCall>,
-    ) -> Result<Option<Vec<ToolCall>>, LlmError> {
-        let tool_calls = Self::drain_partial_tool_calls(partials)?;
-        if tool_calls.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(tool_calls))
-    }
-
     /// 处理单条 `data:` 负载，并将解析出的 chunk 追加到 `state.pending`。
-    fn handle_stream_data(
+    pub(super) fn handle_stream_data(
         provider_name: &str,
         data: &str,
         state: &mut StreamState,
     ) -> Result<(), LlmError> {
         if data == "[DONE]" {
             state.finish();
-            if let Some(tool_calls) = Self::finalize_pending_tool_calls(&mut state.tool_calls)? {
-                state.enqueue_tool_calls(tool_calls);
-            }
+            let tool_calls = Self::drain_partial_tool_calls(&mut state.tool_calls)?;
+            state.enqueue_tool_calls(tool_calls);
             return Ok(());
         }
 
@@ -287,34 +269,6 @@ impl ChatCompletionsAdapter {
         let chunks = Self::parse_stream_event(provider_name, &raw, &mut state.tool_calls)?;
         state.pending.extend(chunks.into_iter().map(Ok));
         Ok(())
-    }
-
-    /// 扫描缓冲区中已完整到达的 SSE 事件。
-    ///
-    /// 返回 `true` 表示流已经结束或遇到错误，外层应停止继续消费本批字节。
-    fn process_buffered_events(provider_name: &str, state: &mut StreamState) -> bool {
-        while let Some(event) = take_sse_event(&mut state.buffer) {
-            match parse_sse_data(&event, provider_name) {
-                Ok(Some(data)) => {
-                    if let Err(err) = Self::handle_stream_data(provider_name, &data, state) {
-                        state.finish();
-                        state.pending.push_back(Err(err));
-                        return true;
-                    }
-                    if state.done {
-                        return true;
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    state.finish();
-                    state.pending.push_back(Err(err));
-                    return true;
-                }
-            }
-        }
-
-        false
     }
 
     /// 解析单个 SSE JSON 事件，返回零个或多个 [`ChatChunk`]。
@@ -421,7 +375,7 @@ impl ChatCompletionsAdapter {
                 pending: VecDeque::new(),
                 tool_calls: BTreeMap::new(),
                 started_at: request_started_at,
-                first_chunk_logged: false,
+                saw_first_chunk: false,
                 done: false,
             },
             move |mut state| async move {
@@ -433,7 +387,7 @@ impl ChatCompletionsAdapter {
                         tracing::debug!(
                             provider = provider_name,
                             total_elapsed_ms = state.started_at.elapsed().as_millis() as u64,
-                            saw_first_chunk = state.first_chunk_logged,
+                            saw_first_chunk = state.saw_first_chunk,
                             "chat_stream 结束"
                         );
                         return None;
@@ -442,7 +396,7 @@ impl ChatCompletionsAdapter {
                     match state.source.next().await {
                         Some(Ok(bytes)) => {
                             state.buffer.extend_from_slice(&bytes);
-                            Self::process_buffered_events(provider_name, &mut state);
+                            process_buffered_events(provider_name, &mut state);
                         }
                         Some(Err(err)) => {
                             state.finish();
@@ -450,11 +404,9 @@ impl ChatCompletionsAdapter {
                         }
                         None => {
                             state.finish();
-                            match Self::finalize_pending_tool_calls(&mut state.tool_calls) {
-                                Ok(Some(tool_calls)) => {
-                                    state.enqueue_tool_calls(tool_calls);
-                                }
-                                Ok(None) => return None,
+                            match Self::drain_partial_tool_calls(&mut state.tool_calls) {
+                                Ok(calls) if calls.is_empty() => return None,
+                                Ok(calls) => state.enqueue_tool_calls(calls),
                                 Err(err) => return Some((Err(err), state)),
                             }
                         }

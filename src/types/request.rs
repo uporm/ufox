@@ -6,8 +6,11 @@ use crate::types::content::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    /// 低强度推理，适合延迟敏感场景。
     Low,
+    /// 中等强度推理，在质量与延迟之间折中。
     Medium,
+    /// 高强度推理，适合复杂任务或更长思考链路。
     High,
 }
 
@@ -25,11 +28,17 @@ impl ReasoningEffort {
 /// 单次聊天请求。
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
+    /// 按顺序发送给模型的消息列表。
     pub messages: Vec<Message>,
+    /// 限制本次生成允许返回的最大输出 token 数。
     pub max_tokens: Option<u32>,
+    /// 控制采样随机性，值越高结果通常越发散。
     pub temperature: Option<f32>,
+    /// 控制核采样的累积概率阈值，用于裁剪候选 token 分布。
     pub top_p: Option<f32>,
+    /// 提供给模型的可调用工具定义列表。
     pub tools: Vec<Tool>,
+    /// 指定模型在本次请求中的工具选择策略。
     pub tool_choice: ToolChoice,
     /// 是否启用 thinking 模式。
     pub thinking: bool,
@@ -63,6 +72,7 @@ impl Default for ChatRequest {
 }
 
 impl ChatRequest {
+    /// 返回 `ChatRequest` 的链式构造器。
     pub fn builder() -> ChatRequestBuilder {
         ChatRequestBuilder {
             inner: Self::default(),
@@ -97,6 +107,7 @@ impl ChatRequestBuilder {
         self
     }
 
+    /// 追加一条仅包含文本内容的 user 消息。
     pub fn user_text(mut self, text: impl Into<String>) -> Self {
         self.inner.messages.push(Message {
             role: Role::User,
@@ -106,6 +117,7 @@ impl ChatRequestBuilder {
         self
     }
 
+    /// 追加一条由多个内容片段组成的 user 消息。
     pub fn user(mut self, parts: Vec<ContentPart>) -> Self {
         self.inner.messages.push(Message {
             role: Role::User,
@@ -115,26 +127,31 @@ impl ChatRequestBuilder {
         self
     }
 
+    /// 设置本次生成允许返回的最大输出 token 数。
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.inner.max_tokens = Some(n);
         self
     }
 
+    /// 设置采样温度。
     pub fn temperature(mut self, t: f32) -> Self {
         self.inner.temperature = Some(t);
         self
     }
 
+    /// 设置核采样的累积概率阈值。
     pub fn top_p(mut self, p: f32) -> Self {
         self.inner.top_p = Some(p);
         self
     }
 
+    /// 覆盖可供模型调用的工具列表。
     pub fn tools(mut self, tools: Vec<Tool>) -> Self {
         self.inner.tools = tools;
         self
     }
 
+    /// 设置模型在本次请求中的工具选择策略。
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.inner.tool_choice = choice;
         self
@@ -164,11 +181,13 @@ impl ChatRequestBuilder {
         self
     }
 
+    /// 追加一项透传给 provider 的扩展参数。
     pub fn extension(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.inner.extensions.insert(key.into(), value);
         self
     }
 
+    /// 构建最终的聊天请求对象。
     pub fn build(self) -> ChatRequest {
         self.inner
     }
@@ -177,44 +196,63 @@ impl ChatRequestBuilder {
 /// 向量化请求。
 #[derive(Debug, Clone)]
 pub struct EmbeddingRequest {
+    /// 需要生成向量的原始输入文本列表。
     pub inputs: Vec<String>,
+    /// 期望返回的向量维度，未指定时由 provider 决定。
     pub dimensions: Option<usize>,
+    /// 透传给 provider 的差异化参数。
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 语音转文本请求。
 #[derive(Debug, Clone)]
 pub struct SpeechToTextRequest {
+    /// 待识别的音频媒体来源。
     pub source: MediaSource,
+    /// 输入音频的封装格式。
     pub format: AudioFormat,
+    /// 提示 provider 优先按该语言进行识别。
     pub language: Option<String>,
+    /// 透传给 provider 的差异化参数。
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 文本转语音请求。
 #[derive(Debug, Clone)]
 pub struct TextToSpeechRequest {
+    /// 需要合成语音的原始文本。
     pub text: String,
+    /// 指定 provider 使用的音色或说话人。
     pub voice: Option<String>,
+    /// 输出音频的封装格式。
     pub output_format: AudioFormat,
+    /// 透传给 provider 的差异化参数。
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 图片生成请求。
 #[derive(Debug, Clone)]
 pub struct ImageGenRequest {
+    /// 用于生成图片的文本提示词。
     pub prompt: String,
+    /// 期望生成的图片数量。
     pub n: Option<u32>,
+    /// 期望输出的图片尺寸。
     pub size: Option<String>,
+    /// 透传给 provider 的差异化参数。
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 视频生成请求。
 #[derive(Debug, Clone)]
 pub struct VideoGenRequest {
+    /// 用于生成视频的文本提示词。
     pub prompt: String,
+    /// 期望输出的视频时长，单位为秒。
     pub duration_secs: Option<u32>,
+    /// 期望输出的视频封装格式。
     pub output_format: Option<VideoFormat>,
+    /// 透传给 provider 的差异化参数。
     pub extensions: serde_json::Map<String, serde_json::Value>,
 }
 

@@ -24,39 +24,84 @@ use crate::{
 
 use super::super::{
     RESPONSES_PATH, ChatChunkStream,
-    http::{OpenAiRequestBuilder, map_stream_read_error, parse_sse_data, send_request, take_sse_event},
+    http::{OpenAiRequestBuilder, SseState, map_stream_read_error, process_buffered_events, send_request},
 };
 use super::ResponsesAdapter;
 
 // ── StreamState —— unfold 状态容器 ────────────────────────────────────────────
 
 /// `stream::unfold` 的携带状态。
-///
-/// 字段说明：
-/// - `source` — 原始 HTTP 字节流
-/// - `buffer` — 字节缓冲，存放尚未凑成完整 SSE 帧的字节
-/// - `pending` — 已解析但尚未 yield 的 chunk 队列
-/// - `started_at` — 请求发起时间，用于日志计时
-/// - `first_chunk_logged` — 首个 chunk 延迟是否已记录
-/// - `saw_text_delta` — 是否已通过 delta 事件发送过文本内容
-///   （若是，完整快照中的文本不再重复 yield）
-/// - `saw_thinking_delta` — 是否已通过 delta 事件发送过思考链内容
-/// - `done` — 是否已收到结束事件或遇到不可恢复错误
 pub(super) struct StreamState {
     pub(super) source:
         Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     pub(super) buffer: Vec<u8>,
     pub(super) pending: VecDeque<Result<ChatChunk, LlmError>>,
     pub(super) started_at: std::time::Instant,
-    pub(super) first_chunk_logged: bool,
+    pub(super) saw_first_chunk: bool,
     pub(super) saw_text_delta: bool,
     pub(super) saw_thinking_delta: bool,
     pub(super) done: bool,
 }
 
+impl StreamState {
+    /// 将流标记为结束。
+    pub(super) fn finish(&mut self) {
+        self.done = true;
+    }
+}
+
+impl SseState for StreamState {
+    fn buffer_mut(&mut self) -> &mut Vec<u8> { &mut self.buffer }
+    fn is_done(&self) -> bool { self.done }
+    fn abort(&mut self, err: LlmError) {
+        self.done = true;
+        self.pending.push_back(Err(err));
+    }
+    fn handle_data(&mut self, provider_name: &str, data: &str) -> Result<(), LlmError> {
+        ResponsesAdapter::handle_stream_data(provider_name, data, self)
+    }
+}
+
 // ── impl ResponsesAdapter（流式方法）─────────────────────────────────────────
 
 impl ResponsesAdapter {
+    /// 处理单条 `data:` 负载，解析事件并将产出 chunk 追加到 `state.pending`。
+    pub(super) fn handle_stream_data(
+        provider_name: &str,
+        data: &str,
+        state: &mut StreamState,
+    ) -> Result<(), LlmError> {
+        if data == "[DONE]" {
+            state.finish();
+            return Ok(());
+        }
+
+        let raw = serde_json::from_str::<serde_json::Value>(data).map_err(|err| {
+            LlmError::StreamProtocol {
+                provider: provider_name.to_owned(),
+                message: format!("stream json 解析失败: {err}"),
+            }
+        })?;
+
+        let chunks = Self::parse_stream_event(
+            provider_name,
+            &raw,
+            &mut state.saw_text_delta,
+            &mut state.saw_thinking_delta,
+        )?;
+
+        // response.completed / incomplete 是终止事件，处理完后关闭流
+        if matches!(
+            raw.get("type").and_then(|v| v.as_str()),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            state.finish();
+        }
+
+        state.pending.extend(chunks.into_iter().map(Ok));
+        Ok(())
+    }
+
     /// 建立 Responses API 流式连接并返回 [`ChatChunkStream`]。
     ///
     /// 内部使用 `stream::unfold` 驱动 [`StreamState`] 状态机：
@@ -99,19 +144,18 @@ impl ResponsesAdapter {
                 buffer: Vec::new(),
                 pending: VecDeque::new(),
                 started_at: request_started_at,
-                first_chunk_logged: false,
+                saw_first_chunk: false,
                 saw_text_delta: false,
                 saw_thinking_delta: false,
                 done: false,
             },
             move |mut state| async move {
                 loop {
-                    // 优先消费已解析的 chunk
                     if let Some(item) = state.pending.pop_front() {
                         if let Ok(chunk) = &item
-                            && !state.first_chunk_logged
+                            && !state.saw_first_chunk
                         {
-                            state.first_chunk_logged = true;
+                            state.saw_first_chunk = true;
                             tracing::info!(
                                 provider = provider_name,
                                 first_chunk_latency_ms =
@@ -129,74 +173,19 @@ impl ResponsesAdapter {
                         tracing::info!(
                             provider = provider_name,
                             total_elapsed_ms = state.started_at.elapsed().as_millis() as u64,
-                            saw_first_chunk = state.first_chunk_logged,
+                            saw_first_chunk = state.saw_first_chunk,
                             "responses_stream 结束"
                         );
                         return None;
                     }
 
-                    // 读取下一批字节
                     match state.source.next().await {
                         Some(Ok(bytes)) => {
                             state.buffer.extend_from_slice(&bytes);
-                            // 尽可能多地分割出完整 SSE 帧
-                            while let Some(event) = take_sse_event(&mut state.buffer) {
-                                match parse_sse_data(&event, provider_name) {
-                                    Ok(Some(data)) if data == "[DONE]" => {
-                                        state.done = true;
-                                        break;
-                                    }
-                                    Ok(Some(data)) => {
-                                        match serde_json::from_str::<serde_json::Value>(&data) {
-                                            Ok(raw) => {
-                                                match ResponsesAdapter::parse_stream_event(
-                                                    provider_name,
-                                                    &raw,
-                                                    &mut state.saw_text_delta,
-                                                    &mut state.saw_thinking_delta,
-                                                ) {
-                                                    Ok(chunks) => {
-                                                        // response.completed / incomplete 是终止事件
-                                                        if matches!(
-                                                            raw.get("type").and_then(|value| value.as_str()),
-                                                            Some("response.completed" | "response.incomplete")
-                                                        ) {
-                                                            state.done = true;
-                                                        }
-                                                        state.pending.extend(chunks.into_iter().map(Ok));
-                                                    }
-                                                    Err(err) => {
-                                                        state.done = true;
-                                                        state.pending.push_back(Err(err));
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                state.done = true;
-                                                state.pending.push_back(Err(
-                                                    LlmError::StreamProtocol {
-                                                        provider: provider_name.to_owned(),
-                                                        message: format!(
-                                                            "stream json 解析失败: {err}"
-                                                        ),
-                                                    },
-                                                ));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Ok(None) => {} // 非 data 帧，跳过
-                                    Err(err) => {
-                                        state.done = true;
-                                        state.pending.push_back(Err(err));
-                                        break;
-                                    }
-                                }
-                            }
+                            process_buffered_events(provider_name, &mut state);
                         }
                         Some(Err(err)) => {
-                            state.done = true;
+                            state.finish();
                             return Some((
                                 Err(map_stream_read_error(read_timeout_ms, err)),
                                 state,
