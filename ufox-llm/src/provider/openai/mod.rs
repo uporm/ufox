@@ -40,12 +40,8 @@ use std::pin::Pin;
 use futures::Stream;
 
 use crate::{
-    error::LlmError,
-    middleware::Transport,
-    provider::ApiProtocol,
-    types::request::ChatRequest,
-    types::content::Role,
-    types::response::ChatChunk,
+    error::LlmError, middleware::Transport, provider::ApiProtocol, types::content::Role,
+    types::request::ChatRequest, types::response::ChatChunk,
 };
 
 use super::ProviderAdapter;
@@ -54,8 +50,7 @@ use http::HttpContext;
 use responses::ResponsesAdapter;
 
 /// 两套协议共用的流式 chunk 输出类型别名。
-pub(super) type ChatChunkStream =
-    Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>;
+pub(super) type ChatChunkStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>;
 
 fn unsupported_multimodal_error(http_context: &HttpContext, role: Role) -> LlmError {
     LlmError::UnsupportedCapability {
@@ -74,7 +69,10 @@ fn unsupported_multimodal_error(http_context: &HttpContext, role: Role) -> LlmEr
 ///
 /// OpenAI 与兼容 provider 当前不支持项目内定义的 `thinking` 请求语义，
 /// 因此这里统一忽略相关字段，避免把不稳定字段透传给后端。
-pub(super) fn normalize_chat_request(provider_name: &'static str, mut req: ChatRequest) -> ChatRequest {
+pub(super) fn normalize_chat_request(
+    provider_name: &'static str,
+    mut req: ChatRequest,
+) -> ChatRequest {
     if req.thinking || req.thinking_budget.is_some() {
         tracing::warn!(
             provider = provider_name,

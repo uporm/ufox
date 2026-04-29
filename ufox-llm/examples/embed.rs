@@ -6,10 +6,7 @@ const PREVIEW_DIMS: usize = 8;
 async fn main() -> Result<(), ufox_llm::LlmError> {
     // 默认走环境变量，避免示例里硬编码密钥和模型配置。
     let client = Client::from_env()?;
-    let inputs = vec![
-        "Rust trait object".to_string(),
-        "async stream".to_string(),
-    ];
+    let inputs = vec!["Rust trait object".to_string(), "async stream".to_string()];
 
     let resp = client
         .embed(EmbeddingRequest {

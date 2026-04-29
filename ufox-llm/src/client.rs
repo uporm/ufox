@@ -121,7 +121,9 @@ impl ClientBuilder {
                 .to_owned(),
         };
 
-        let protocol = self.api_protocol.unwrap_or_else(|| provider.default_protocol());
+        let protocol = self
+            .api_protocol
+            .unwrap_or_else(|| provider.default_protocol());
 
         // 仅 OpenAI 和 Compatible（指向自定义 endpoint）支持 Responses API。
         if protocol == ApiProtocol::Responses
@@ -317,7 +319,10 @@ impl Client {
         path: impl AsRef<Path>,
     ) -> Result<(), LlmError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|err| LlmError::io("创建视频输出目录", err))?;

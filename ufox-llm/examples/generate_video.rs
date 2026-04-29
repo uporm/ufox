@@ -76,7 +76,10 @@ async fn wait_until_finished(
                 // 轮询间隔保持保守，避免在长任务上触发不必要的 provider 限流。
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 response = client.poll_video_task(&response.task_id).await?;
-                println!("轮询状态：task_id={}，status={:?}", response.task_id, response.status);
+                println!(
+                    "轮询状态：task_id={}，status={:?}",
+                    response.task_id, response.status
+                );
             }
         }
     }

@@ -171,7 +171,11 @@ pub(super) async fn send_request<A: OpenAiRequestBuilder>(
     } else {
         let status = response.status().as_u16();
         let body_text = response.text().await?;
-        Err(map_error_response(adapter.provider_name(), status, &body_text))
+        Err(map_error_response(
+            adapter.provider_name(),
+            status,
+            &body_text,
+        ))
     }
 }
 
@@ -206,7 +210,9 @@ pub(super) async fn send_bytes_request<A: OpenAiRequestBuilder>(
 pub(super) fn parse_finish_reason(raw: Option<&str>) -> Option<FinishReason> {
     match raw {
         Some("stop") | Some("completed") => Some(FinishReason::Completed),
-        Some("length") | Some("max_tokens") | Some("max_output_tokens") => Some(FinishReason::MaxOutputTokens),
+        Some("length") | Some("max_tokens") | Some("max_output_tokens") => {
+            Some(FinishReason::MaxOutputTokens)
+        }
         Some("tool_calls") => Some(FinishReason::ToolCalls),
         Some("content_filter") => Some(FinishReason::ContentFilter),
         Some(_) => Some(FinishReason::Failed),
@@ -221,14 +227,11 @@ pub(super) fn parse_finish_reason(raw: Option<&str>) -> Option<FinishReason> {
 /// - Responses API: `input_tokens` / `output_tokens` / `total_tokens`
 pub(super) fn parse_usage(raw: Option<&serde_json::Value>) -> Option<Usage> {
     let raw = raw?;
-    let parse_tokens = |value: Option<&serde_json::Value>| -> Option<u32> {
-        value?.as_u64()?.try_into().ok()
-    };
+    let parse_tokens =
+        |value: Option<&serde_json::Value>| -> Option<u32> { value?.as_u64()?.try_into().ok() };
 
     Some(Usage {
-        prompt_tokens: parse_tokens(
-            raw.get("prompt_tokens").or_else(|| raw.get("input_tokens")),
-        )?,
+        prompt_tokens: parse_tokens(raw.get("prompt_tokens").or_else(|| raw.get("input_tokens")))?,
         completion_tokens: parse_tokens(
             raw.get("completion_tokens")
                 .or_else(|| raw.get("output_tokens")),
@@ -324,13 +327,18 @@ pub(super) fn process_buffered_events<S: SseState>(provider_name: &str, state: &
         let data = match parse_sse_data(&event, provider_name) {
             Ok(Some(data)) => data,
             Ok(None) => continue,
-            Err(err) => { state.abort(err); break; }
+            Err(err) => {
+                state.abort(err);
+                break;
+            }
         };
         if let Err(err) = state.handle_data(provider_name, &data) {
             state.abort(err);
             break;
         }
-        if state.is_done() { break; }
+        if state.is_done() {
+            break;
+        }
     }
 }
 

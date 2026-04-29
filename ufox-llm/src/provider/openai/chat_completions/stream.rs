@@ -30,8 +30,8 @@ use crate::{
 use super::super::{
     CHAT_COMPLETIONS_PATH, ChatChunkStream,
     http::{
-        OpenAiRequestBuilder, SseState, map_stream_read_error, parse_finish_reason,
-        parse_usage, process_buffered_events, send_request,
+        OpenAiRequestBuilder, SseState, map_stream_read_error, parse_finish_reason, parse_usage,
+        process_buffered_events, send_request,
     },
 };
 use super::ChatCompletionsAdapter;
@@ -75,7 +75,11 @@ impl PartialToolCall {
             serde_json::from_str(&self.arguments).map_err(|err| LlmError::ToolProtocol {
                 message: format!("stream tool arguments 解析失败: {err}"),
             })?;
-        Ok(ToolCall { id, tool_name, arguments })
+        Ok(ToolCall {
+            id,
+            tool_name,
+            arguments,
+        })
     }
 }
 
@@ -120,8 +124,12 @@ impl StreamState {
 }
 
 impl SseState for StreamState {
-    fn buffer_mut(&mut self) -> &mut Vec<u8> { &mut self.buffer }
-    fn is_done(&self) -> bool { self.done }
+    fn buffer_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buffer
+    }
+    fn is_done(&self) -> bool {
+        self.done
+    }
     fn abort(&mut self, err: LlmError) {
         self.done = true;
         self.pending.push_back(Err(err));
@@ -188,12 +196,12 @@ impl ChatCompletionsAdapter {
         item: &serde_json::Value,
         partials: &mut BTreeMap<usize, PartialToolCall>,
     ) -> Result<(), LlmError> {
-        let index =
-            item.get("index")
-                .and_then(|value| value.as_u64())
-                .ok_or_else(|| LlmError::ToolProtocol {
-                    message: "stream tool call 缺少 index".into(),
-                })? as usize;
+        let index = item
+            .get("index")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| LlmError::ToolProtocol {
+                message: "stream tool call 缺少 index".into(),
+            })? as usize;
         let entry = partials.entry(index).or_default();
 
         if let Some(id) = item.get("id").and_then(|value| value.as_str()) {

@@ -16,9 +16,11 @@ use crate::{
 const DEFAULT_MIME: &str = "application/octet-stream";
 
 async fn read_local_file(path: &std::path::Path) -> Result<Vec<u8>, LlmError> {
-    tokio::fs::read(path).await.map_err(|err| LlmError::MediaInput {
-        message: format!("读取文件失败 {:?}: {}", path, err),
-    })
+    tokio::fs::read(path)
+        .await
+        .map_err(|err| LlmError::MediaInput {
+            message: format!("读取文件失败 {:?}: {}", path, err),
+        })
 }
 
 fn guess_path_mime(path: &std::path::Path, fallback: Option<&str>) -> String {
@@ -54,8 +56,7 @@ pub(super) async fn resolve_media_source_to_image_url(
         MediaSource::File { path } => {
             let data = read_local_file(path).await?;
             let mime_type = guess_path_mime(path, None);
-            let data =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+            let data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
             Ok(serde_json::json!({
                 "url": format!("data:{mime_type};base64,{data}")
             }))

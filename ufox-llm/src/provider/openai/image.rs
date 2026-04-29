@@ -1,9 +1,6 @@
 use crate::{
     error::LlmError,
-    types::{
-        request::ImageGenRequest,
-        response::ImageGenResponse,
-    },
+    types::{request::ImageGenRequest, response::ImageGenResponse},
 };
 
 use super::http::{OpenAiRequestBuilder, parse_usage, send_json_request};
@@ -63,4 +60,3 @@ pub(super) async fn execute_generate_image<A: OpenAiRequestBuilder>(
         usage: parse_usage(raw.get("usage")),
     })
 }
-

@@ -35,36 +35,37 @@ pub(super) async fn execute_embed<A: OpenAiRequestBuilder>(
             .json(&serde_json::Value::Object(body)),
     )
     .await?;
-    let embeddings =
-        raw.get("data")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| LlmError::ProviderResponse {
-                provider: adapter.provider_name().into(),
-                code: None,
-                message: "embedding 响应缺少 data".into(),
-            })?
-            .iter()
-            .map(|item| {
-                item.get("embedding")
-                    .and_then(|value| value.as_array())
-                    .ok_or_else(|| LlmError::ProviderResponse {
-                        provider: adapter.provider_name().into(),
-                        code: None,
-                        message: "embedding 缺少 embedding 数组".into(),
-                    })?
-                    .iter()
-                    .map(|value| {
-                        value.as_f64().map(|n| n as f32).ok_or_else(|| {
-                            LlmError::ProviderResponse {
-                                provider: adapter.provider_name().into(),
-                                code: None,
-                                message: "embedding 含非数字元素".into(),
-                            }
+    let embeddings = raw
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| LlmError::ProviderResponse {
+            provider: adapter.provider_name().into(),
+            code: None,
+            message: "embedding 响应缺少 data".into(),
+        })?
+        .iter()
+        .map(|item| {
+            item.get("embedding")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| LlmError::ProviderResponse {
+                    provider: adapter.provider_name().into(),
+                    code: None,
+                    message: "embedding 缺少 embedding 数组".into(),
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_f64()
+                        .map(|n| n as f32)
+                        .ok_or_else(|| LlmError::ProviderResponse {
+                            provider: adapter.provider_name().into(),
+                            code: None,
+                            message: "embedding 含非数字元素".into(),
                         })
-                    })
-                    .collect::<Result<Vec<_>, LlmError>>()
-            })
-            .collect::<Result<Vec<_>, LlmError>>()?;
+                })
+                .collect::<Result<Vec<_>, LlmError>>()
+        })
+        .collect::<Result<Vec<_>, LlmError>>()?;
 
     Ok(EmbeddingResponse {
         embeddings,

@@ -23,8 +23,11 @@ use crate::{
 };
 
 use super::super::{
-    RESPONSES_PATH, ChatChunkStream,
-    http::{OpenAiRequestBuilder, SseState, map_stream_read_error, process_buffered_events, send_request},
+    ChatChunkStream, RESPONSES_PATH,
+    http::{
+        OpenAiRequestBuilder, SseState, map_stream_read_error, process_buffered_events,
+        send_request,
+    },
 };
 use super::ResponsesAdapter;
 
@@ -32,8 +35,7 @@ use super::ResponsesAdapter;
 
 /// `stream::unfold` 的携带状态。
 pub(super) struct StreamState {
-    pub(super) source:
-        Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    pub(super) source: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     pub(super) buffer: Vec<u8>,
     pub(super) pending: VecDeque<Result<ChatChunk, LlmError>>,
     pub(super) started_at: std::time::Instant,
@@ -51,8 +53,12 @@ impl StreamState {
 }
 
 impl SseState for StreamState {
-    fn buffer_mut(&mut self) -> &mut Vec<u8> { &mut self.buffer }
-    fn is_done(&self) -> bool { self.done }
+    fn buffer_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buffer
+    }
+    fn is_done(&self) -> bool {
+        self.done
+    }
     fn abort(&mut self, err: LlmError) {
         self.done = true;
         self.pending.push_back(Err(err));
@@ -186,10 +192,7 @@ impl ResponsesAdapter {
                         }
                         Some(Err(err)) => {
                             state.finish();
-                            return Some((
-                                Err(map_stream_read_error(read_timeout_ms, err)),
-                                state,
-                            ));
+                            return Some((Err(map_stream_read_error(read_timeout_ms, err)), state));
                         }
                         None => return None,
                     }

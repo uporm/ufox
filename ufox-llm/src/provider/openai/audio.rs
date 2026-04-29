@@ -49,7 +49,9 @@ pub(super) async fn execute_speech_to_text<A: OpenAiRequestBuilder>(
 
     let raw = send_json_request(
         adapter,
-        adapter.post_multipart("/audio/transcriptions").multipart(form),
+        adapter
+            .post_multipart("/audio/transcriptions")
+            .multipart(form),
     )
     .await?;
     Ok(SpeechToTextResponse {

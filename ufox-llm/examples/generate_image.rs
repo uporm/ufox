@@ -20,9 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    let image = response.images.first().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "服务端未返回任何图片")
-    })?;
+    let image = response
+        .images
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "服务端未返回任何图片"))?;
 
     if let Some(revised_prompt) = &image.revised_prompt {
         println!("服务端改写后的提示词：{revised_prompt}");

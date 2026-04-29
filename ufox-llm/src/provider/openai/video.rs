@@ -48,11 +48,7 @@ fn parse_video_response<A: OpenAiRequestBuilder>(
     let status = parse_task_status(adapter.provider_name(), &raw)?;
     let url = match status {
         // OpenAI 完成后通过 `/videos/{id}/content` 下载二进制内容，这里返回可轮询后使用的资源地址。
-        TaskStatus::Succeeded => Some(format!(
-            "{}/videos/{}/content",
-            adapter.base_url(),
-            task_id
-        )),
+        TaskStatus::Succeeded => Some(format!("{}/videos/{}/content", adapter.base_url(), task_id)),
         TaskStatus::Pending | TaskStatus::Processing | TaskStatus::Failed => None,
     };
 
@@ -72,7 +68,10 @@ pub(super) async fn execute_generate_video<A: OpenAiRequestBuilder>(
     body.insert("model".into(), serde_json::Value::String(model.to_owned()));
     body.insert("prompt".into(), serde_json::Value::String(req.prompt));
     if let Some(duration_secs) = req.duration_secs {
-        body.insert("seconds".into(), serde_json::Value::String(duration_secs.to_string()));
+        body.insert(
+            "seconds".into(),
+            serde_json::Value::String(duration_secs.to_string()),
+        );
     }
     if let Some(output_format) = req.output_format {
         body.insert(
@@ -90,7 +89,9 @@ pub(super) async fn execute_generate_video<A: OpenAiRequestBuilder>(
 
     let raw = send_json_request(
         adapter,
-        adapter.post_json("/videos").json(&serde_json::Value::Object(body)),
+        adapter
+            .post_json("/videos")
+            .json(&serde_json::Value::Object(body)),
     )
     .await?;
     parse_video_response(adapter, raw)
@@ -108,7 +109,8 @@ pub(super) async fn execute_download_video_stream<A: OpenAiRequestBuilder>(
     adapter: &A,
     task_id: &str,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>, LlmError> {
-    let response = send_request(adapter, adapter.get(&format!("/videos/{task_id}/content"))).await?;
+    let response =
+        send_request(adapter, adapter.get(&format!("/videos/{task_id}/content"))).await?;
     Ok(Box::pin(response.bytes_stream().map(|chunk| {
         chunk.map_err(|err| LlmError::transport("读取视频下载流", err))
     })))

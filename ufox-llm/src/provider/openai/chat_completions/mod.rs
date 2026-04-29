@@ -37,8 +37,7 @@ use super::{
     },
     image,
     media::resolve_media_source_to_image_url,
-    normalize_chat_request,
-    unsupported_multimodal_error,
+    normalize_chat_request, unsupported_multimodal_error,
 };
 use crate::provider::ProviderAdapter;
 

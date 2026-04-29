@@ -35,8 +35,7 @@ use super::{
     http::{HttpContext, OpenAiRequestBuilder, parse_usage, send_json_request},
     image,
     media::resolve_media_source_to_image_url,
-    normalize_chat_request,
-    unsupported_multimodal_error,
+    normalize_chat_request, unsupported_multimodal_error,
 };
 use crate::provider::ProviderAdapter;
 
@@ -307,7 +306,9 @@ impl ResponsesAdapter {
                 .and_then(|value| value.get("reason"))
                 .and_then(|value| value.as_str())
             {
-                Some("max_output_tokens") | Some("max_tokens") | Some("length") => Some(FinishReason::MaxOutputTokens),
+                Some("max_output_tokens") | Some("max_tokens") | Some("length") => {
+                    Some(FinishReason::MaxOutputTokens)
+                }
                 Some("content_filter") => Some(FinishReason::ContentFilter),
                 Some(_) | None => Some(FinishReason::Failed),
             },
@@ -852,6 +853,9 @@ mod tests {
         assert_eq!(chunks[0].text_delta.as_deref(), Some("你好"));
         assert_eq!(chunks[0].thinking_delta.as_deref(), Some("先打招呼。"));
         assert_eq!(chunks[0].usage.as_ref().unwrap().total_tokens, 8);
-        assert!(matches!(chunks[0].finish_reason, Some(FinishReason::Completed)));
+        assert!(matches!(
+            chunks[0].finish_reason,
+            Some(FinishReason::Completed)
+        ));
     }
 }

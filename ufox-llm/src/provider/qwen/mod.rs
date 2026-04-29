@@ -9,7 +9,7 @@ use crate::{
     types::{request::ChatRequest, response::ChatChunk, response::ChatResponse},
 };
 
-use super::{ProviderAdapter, ApiProtocol, openai};
+use super::{ApiProtocol, ProviderAdapter, openai};
 
 /// 通义千问适配器。
 struct QwenAdapter {
@@ -79,7 +79,13 @@ pub(crate) fn build(
     base_url: &str,
     transport: &Transport,
 ) -> Result<Box<dyn ProviderAdapter>, LlmError> {
-    let compatible_chat = openai::build("qwen", ApiProtocol::ChatCompletions, api_key, base_url, transport)?;
+    let compatible_chat = openai::build(
+        "qwen",
+        ApiProtocol::ChatCompletions,
+        api_key,
+        base_url,
+        transport,
+    )?;
     Ok(Box::new(QwenAdapter::new(compatible_chat)))
 }
 
@@ -89,10 +95,7 @@ mod tests {
 
     use crate::{
         middleware::{RetryConfig, Transport, TransportConfig},
-        types::{
-            request::ChatRequest,
-            response::ChatResponse,
-        },
+        types::{request::ChatRequest, response::ChatResponse},
     };
 
     use super::*;
@@ -136,7 +139,8 @@ mod tests {
             &self,
             _model: &str,
             req: ChatRequest,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>, LlmError> {
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ChatChunk, LlmError>> + Send>>, LlmError>
+        {
             *self.seen.lock().unwrap() = Some(req);
             Ok(Box::pin(stream::empty()))
         }

@@ -357,8 +357,14 @@ data: [DONE]\n\n",
     let third = stream.next().await.unwrap().unwrap();
     assert_eq!(third.tool_calls.len(), 1);
     assert_eq!(third.tool_calls[0].tool_name, "get_weather");
-    assert_eq!(third.tool_calls[0].arguments, serde_json::json!({ "city": "杭州" }));
-    assert!(matches!(third.finish_reason, Some(crate::FinishReason::ToolCalls)));
+    assert_eq!(
+        third.tool_calls[0].arguments,
+        serde_json::json!({ "city": "杭州" })
+    );
+    assert!(matches!(
+        third.finish_reason,
+        Some(crate::FinishReason::ToolCalls)
+    ));
     assert_eq!(third.usage.unwrap().total_tokens, 18);
 }
 
